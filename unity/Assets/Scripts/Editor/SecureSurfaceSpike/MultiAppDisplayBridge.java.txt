@@ -1,0 +1,660 @@
+package com.mlomega.xr.securesurface;
+
+import android.app.Activity;
+import android.app.Presentation;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.ColorDrawable;
+import android.hardware.display.DisplayManager;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Parcel;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Display;
+import android.view.Surface;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+import rikka.shizuku.Shizuku;
+
+/**
+ * Package-gated Browser Lab transport for several simultaneous, non-commercial
+ * Android application windows. Each session owns a Shizuku UserService, trusted
+ * VirtualDisplay, cursor Presentation and XREAL Surface. The commercial cinema
+ * path deliberately remains in SecureWidevinePlayer.
+ */
+public final class MultiAppDisplayBridge {
+    private static final String TAG = "MLOmegaMultiApp";
+    private static final int DISPLAY_FLAGS = 0xDD4B;
+    private static final ConcurrentHashMap<Integer, Session> SESSIONS =
+            new ConcurrentHashMap<>();
+
+    private MultiAppDisplayBridge() {}
+
+    private static final class Session {
+        final int id;
+        final Activity activity;
+        volatile Surface surface;
+        volatile int width;
+        volatile int height;
+        volatile int densityDpi;
+        final String packageName;
+        final String launchUri;
+        final int serviceSlot;
+        volatile String status = "initialisation";
+        volatile IBinder binder;
+        volatile int displayId = -1;
+        volatile long pointerDownTime;
+        Shizuku.UserServiceArgs args;
+        ServiceConnection connection;
+        CursorPresentation cursorPresentation;
+        CursorView cursorView;
+
+        Session(
+                int id,
+                Activity activity,
+                Surface surface,
+                int width,
+                int height,
+                int densityDpi,
+                String packageName,
+                String launchUri,
+                int serviceSlot) {
+            this.id = id;
+            this.activity = activity;
+            this.surface = surface;
+            this.width = Math.max(640, width);
+            this.height = Math.max(360, height);
+            this.densityDpi = Math.max(160, densityDpi);
+            this.packageName = packageName;
+            this.launchUri = launchUri == null ? "" : launchUri;
+            this.serviceSlot = serviceSlot;
+        }
+    }
+
+    public static void startApplicationDisplay(
+            int sessionId,
+            Activity activity,
+            Surface surface,
+            int width,
+            int height,
+            int densityDpi,
+            String packageName,
+            String launchUri) {
+        if (activity == null || surface == null || packageName == null
+                || packageName.trim().isEmpty()) return;
+        activity.runOnUiThread(() -> {
+            releaseInternal(sessionId, true);
+            int serviceSlot = findFreeServiceSlot();
+            if (serviceSlot < 1) {
+                Log.e(TAG, "no free UserService slot for session=" + sessionId);
+                return;
+            }
+            Session session = new Session(
+                    sessionId,
+                    activity,
+                    surface,
+                    width,
+                    height,
+                    densityDpi,
+                    packageName.trim(),
+                    launchUri,
+                    serviceSlot);
+            SESSIONS.put(sessionId, session);
+            try {
+                if (!Shizuku.pingBinder()) {
+                    session.status = "SHIZUKU: service non demarre";
+                    return;
+                }
+                if (Shizuku.checkSelfPermission()
+                        != PackageManager.PERMISSION_GRANTED) {
+                    session.status = "SHIZUKU: autorisation requise";
+                    Shizuku.requestPermission(9200 + Math.abs(sessionId % 400));
+                    return;
+                }
+                session.connection = new ServiceConnection() {
+                    @Override
+                    public void onServiceConnected(ComponentName name, IBinder binder) {
+                        session.binder = binder;
+                        createDisplayAndLaunch(session);
+                    }
+
+                    @Override
+                    public void onServiceDisconnected(ComponentName name) {
+                        session.binder = null;
+                        session.displayId = -1;
+                        session.status = "service deconnecte";
+                    }
+                };
+                // Shizuku identifies a UserService by its component, not only by
+                // processNameSuffix. Reusing TrustedDisplayUserService therefore
+                // reused one Binder whose single VirtualDisplay field was replaced
+                // by the next app. Three real component classes give every lab
+                // window an independent process, Binder and VirtualDisplay.
+                int slot = session.serviceSlot;
+                String serviceClass = TrustedDisplayUserService.class
+                        .getPackage().getName()
+                        + ".TrustedDisplayUserServiceSlot" + slot;
+                session.args = new Shizuku.UserServiceArgs(
+                        new ComponentName(activity.getPackageName(), serviceClass))
+                        .daemon(false)
+                        .processNameSuffix("mlomega_app_slot_" + slot)
+                        .debuggable(false)
+                        .version(2);
+                Log.i(TAG, "MULTI_APP_SERVICE_SLOT session=" + sessionId
+                        + " slot=" + slot + " component=" + serviceClass);
+                session.status = "connexion display trusted";
+                Shizuku.bindUserService(session.args, session.connection);
+            } catch (Throwable error) {
+                session.status = "EXCEPTION: " + error.getClass().getSimpleName();
+                Log.e(TAG, "session start failed id=" + sessionId, error);
+            }
+        });
+    }
+
+    private static int findFreeServiceSlot() {
+        for (int candidate = 1; candidate <= 3; candidate++) {
+            boolean used = false;
+            for (Session session : SESSIONS.values()) {
+                if (session.serviceSlot == candidate) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) return candidate;
+        }
+        return -1;
+    }
+
+    private static void createDisplayAndLaunch(Session session) {
+        IBinder binder = session.binder;
+        if (binder == null || session.surface == null) return;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeString("MLOmega app " + session.id);
+            data.writeInt(session.width);
+            data.writeInt(session.height);
+            data.writeInt(session.densityDpi);
+            data.writeInt(DISPLAY_FLAGS);
+            session.surface.writeToParcel(data, 0);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_CREATE,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            session.displayId = reply.readInt();
+            if (session.displayId < 0)
+                throw new IllegalStateException("display=" + session.displayId);
+
+            data.recycle();
+            reply.recycle();
+            data = Parcel.obtain();
+            reply = Parcel.obtain();
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(session.displayId);
+            data.writeString(session.packageName);
+            data.writeString(session.launchUri);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_LAUNCH_APP,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String result = reply.readString();
+            session.status = "DISPLAY " + session.displayId + " " + result;
+            Log.i(TAG, "MULTI_APP_LAUNCH_RECEIPT session=" + session.id
+                    + " package=" + session.packageName
+                    + " display=" + session.displayId
+                    + " result=" + result);
+            showCursor(session, 8);
+        } catch (Throwable error) {
+            session.status = "EXCEPTION: " + error.getClass().getSimpleName();
+            Log.e(TAG, "create/launch failed session=" + session.id, error);
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static String getStatus(int sessionId) {
+        Session session = SESSIONS.get(sessionId);
+        return session == null ? "session absente" : session.status;
+    }
+
+    public static boolean resizeApplicationDisplay(
+            int sessionId,
+            int width,
+            int height,
+            int densityDpi) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.binder == null || session.displayId < 0)
+            return false;
+        int safeWidth = Math.max(640, Math.min(1920, width));
+        int safeHeight = Math.max(360, Math.min(1600, height));
+        int safeDpi = Math.max(160, densityDpi);
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(safeWidth);
+            data.writeInt(safeHeight);
+            data.writeInt(safeDpi);
+            session.binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_RESIZE_DISPLAY,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean resized = reply.readInt() != 0;
+            if (resized) {
+                session.width = safeWidth;
+                session.height = safeHeight;
+                session.densityDpi = safeDpi;
+                session.status = "DISPLAY " + session.displayId + " "
+                        + safeWidth + "x" + safeHeight;
+            }
+            return resized;
+        } catch (Throwable error) {
+            Log.e(TAG, "resize failed session=" + sessionId, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /** Rebinds one existing trusted VirtualDisplay to a replacement XREAL
+     * composition surface. Resizing a VirtualDisplay without replacing the
+     * buffer queue left the two eyes consuming different geometries on One Pro. */
+    public static boolean reattachTrustedSurface(
+            int sessionId,
+            Surface surface,
+            int width,
+            int height) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.binder == null || session.displayId < 0
+                || surface == null || !surface.isValid()) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            surface.writeToParcel(data, 0);
+            session.binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_REATTACH_SURFACE,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean attached = reply.readInt() != 0;
+            if (attached) {
+                session.surface = surface;
+                session.width = Math.max(640, width);
+                session.height = Math.max(360, height);
+                session.status = "DISPLAY " + session.displayId + " "
+                        + session.width + "x" + session.height;
+            }
+            Log.i(TAG, "surface reattach session=" + sessionId
+                    + " attached=" + attached + " size=" + width + "x" + height);
+            return attached;
+        } catch (Throwable error) {
+            Log.e(TAG, "surface reattach failed session=" + sessionId, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean pointerDown(int sessionId, float x, float y) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null) return false;
+        session.pointerDownTime = SystemClock.uptimeMillis();
+        setCursorVisible(session, false, true);
+        boolean sent = sendPointer(session, 0, x, y, session.pointerDownTime);
+        if (!sent) {
+            session.pointerDownTime = 0L;
+            setCursorVisible(session, true, false);
+            updateCursor(session, x, y, false);
+        }
+        return sent;
+    }
+
+    public static boolean pointerMove(int sessionId, float x, float y) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.pointerDownTime <= 0L) return false;
+        return sendPointer(session, 2, x, y, session.pointerDownTime);
+    }
+
+    public static boolean pointerUp(int sessionId, float x, float y) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.pointerDownTime <= 0L) return false;
+        long down = session.pointerDownTime;
+        session.pointerDownTime = 0L;
+        boolean sent = sendPointer(session, 1, x, y, down);
+        updateCursor(session, x, y, false);
+        setCursorVisible(session, true, false);
+        return sent;
+    }
+
+    public static boolean pointerCancel(int sessionId, float x, float y) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.pointerDownTime <= 0L) return false;
+        long down = session.pointerDownTime;
+        session.pointerDownTime = 0L;
+        boolean sent = sendPointer(session, 3, x, y, down);
+        updateCursor(session, x, y, false);
+        setCursorVisible(session, true, false);
+        return sent;
+    }
+
+    public static boolean pointerHover(int sessionId, float x, float y) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.binder == null || session.displayId < 0)
+            return false;
+        updateCursor(session, x, y, false);
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(session.displayId);
+            data.writeFloat(x);
+            data.writeFloat(y);
+            session.binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_HOVER,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "hover failed session=" + sessionId, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static boolean sendPointer(
+            Session session,
+            int action,
+            float x,
+            float y,
+            long downTime) {
+        IBinder binder = session.binder;
+        if (binder == null || !binder.pingBinder() || session.displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(session.displayId);
+            data.writeInt(action);
+            data.writeFloat(x);
+            data.writeFloat(y);
+            data.writeLong(downTime);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_POINTER,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "pointer failed session=" + session.id, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean inputText(int sessionId, String text) {
+        return transactInput(sessionId,
+                TrustedDisplayUserService.TRANSACTION_INPUT_TEXT, text, 0);
+    }
+
+    public static boolean inputKey(int sessionId, int keyCode) {
+        return transactInput(sessionId,
+                TrustedDisplayUserService.TRANSACTION_INPUT_KEY, null, keyCode);
+    }
+
+    public static boolean clearText(int sessionId) {
+        return transactInput(sessionId,
+                TrustedDisplayUserService.TRANSACTION_CLEAR_TEXT, null, 0);
+    }
+
+    public static boolean openKeyboard(int sessionId) {
+        return transactInput(sessionId,
+                TrustedDisplayUserService.TRANSACTION_OPEN_KEYBOARD, null, 0);
+    }
+
+    private static boolean transactInput(
+            int sessionId,
+            int transaction,
+            String text,
+            int keyCode) {
+        Session session = SESSIONS.get(sessionId);
+        if (session == null || session.binder == null || session.displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(session.displayId);
+            if (transaction == TrustedDisplayUserService.TRANSACTION_INPUT_TEXT)
+                data.writeString(text);
+            else if (transaction == TrustedDisplayUserService.TRANSACTION_INPUT_KEY)
+                data.writeInt(keyCode);
+            session.binder.transact(transaction, data, reply, 0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "input failed session=" + sessionId, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static void releaseAndStop(Activity activity, int sessionId) {
+        if (activity == null) {
+            releaseInternal(sessionId, true);
+            return;
+        }
+        activity.runOnUiThread(() -> releaseInternal(sessionId, true));
+    }
+
+    private static void releaseInternal(int sessionId, boolean stopPackage) {
+        Session session = SESSIONS.remove(sessionId);
+        if (session == null) return;
+        if (session.cursorPresentation != null) {
+            try { session.cursorPresentation.dismiss(); } catch (Throwable ignored) {}
+            session.cursorPresentation = null;
+            session.cursorView = null;
+        }
+        IBinder binder = session.binder;
+        if (binder != null && binder.pingBinder()) {
+            if (stopPackage) transactStopPackage(session, binder);
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                binder.transact(
+                        TrustedDisplayUserService.TRANSACTION_RELEASE,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+            } catch (Throwable error) {
+                Log.w(TAG, "release failed session=" + sessionId, error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        }
+        if (session.args != null && session.connection != null) {
+            try {
+                Shizuku.unbindUserService(
+                        session.args, session.connection, true);
+            } catch (Throwable error) {
+                Log.w(TAG, "unbind failed session=" + sessionId, error);
+            }
+        }
+        session.binder = null;
+        session.displayId = -1;
+    }
+
+    private static void transactStopPackage(Session session, IBinder binder) {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeString(session.packageName);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_STOP_PACKAGE,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean stopped = reply.readInt() != 0;
+            Log.i(TAG, "MULTI_APP_STOP_RECEIPT session=" + session.id
+                    + " package=" + session.packageName
+                    + " stopped=" + stopped);
+        } catch (Throwable error) {
+            Log.w(TAG, "stop failed session=" + session.id, error);
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static void showCursor(Session session, int retries) {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (!SESSIONS.containsKey(session.id)) return;
+            try {
+                DisplayManager manager = (DisplayManager) session.activity
+                        .getSystemService(Context.DISPLAY_SERVICE);
+                Display display = manager == null
+                        ? null : manager.getDisplay(session.displayId);
+                if (display == null) {
+                    if (retries > 0) showCursor(session, retries - 1);
+                    return;
+                }
+                session.cursorPresentation =
+                        new CursorPresentation(session.activity, display);
+                session.cursorPresentation.show();
+                session.cursorView = session.cursorPresentation.cursor;
+                Log.i(TAG, "cursor ready session=" + session.id
+                        + " display=" + session.displayId);
+            } catch (Throwable error) {
+                Log.e(TAG, "cursor failed session=" + session.id, error);
+            }
+        }, retries == 8 ? 900L : 250L);
+    }
+
+    private static void updateCursor(
+            Session session, float x, float y, boolean pressed) {
+        CursorView view = session.cursorView;
+        if (view != null) view.post(() -> view.setPointer(x, y, pressed));
+    }
+
+    private static void setCursorVisible(
+            Session session, boolean visible, boolean wait) {
+        CursorPresentation presentation = session.cursorPresentation;
+        CursorView view = session.cursorView;
+        if (presentation == null) return;
+        Runnable change = () -> {
+            try {
+                if (view != null)
+                    view.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+                if (visible) presentation.show(); else presentation.hide();
+            } catch (Throwable error) {
+                Log.w(TAG, "cursor visibility failed session=" + session.id, error);
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) change.run();
+        else session.activity.runOnUiThread(change);
+        if (!visible && wait && Looper.myLooper() != Looper.getMainLooper())
+            SystemClock.sleep(60L);
+    }
+
+    private static final class CursorPresentation extends Presentation {
+        CursorView cursor;
+
+        CursorPresentation(Context context, Display display) {
+            super(context, display);
+        }
+
+        @Override
+        protected void onCreate(android.os.Bundle state) {
+            super.onCreate(state);
+            Window window = getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setDimAmount(0f);
+                window.setFormat(PixelFormat.TRANSLUCENT);
+                window.addFlags(
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                WindowManager.LayoutParams attributes = window.getAttributes();
+                attributes.alpha = 0.72f;
+                window.setAttributes(attributes);
+            }
+            cursor = new CursorView(getContext());
+            setContentView(cursor);
+        }
+    }
+
+    private static final class CursorView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float x = -100f;
+        private float y = -100f;
+        private boolean pressed;
+
+        CursorView(Context context) {
+            super(context);
+            setBackgroundColor(Color.TRANSPARENT);
+            setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        }
+
+        void setPointer(float px, float py, boolean down) {
+            x = px;
+            y = py;
+            pressed = down;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (x < 0f || y < 0f) return;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(210, 12, 16, 22));
+            canvas.drawCircle(x, y, pressed ? 17f : 14f, paint);
+            paint.setColor(Color.argb(255, 246, 249, 255));
+            canvas.drawCircle(x, y, pressed ? 11f : 9f, paint);
+            paint.setColor(pressed
+                    ? Color.rgb(54, 220, 255)
+                    : Color.rgb(100, 118, 142));
+            canvas.drawCircle(x, y, pressed ? 5f : 3.5f, paint);
+        }
+    }
+}

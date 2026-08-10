@@ -1,0 +1,24 @@
+{
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.0.3",
+    "com.unity.nuget.newtonsoft-json": "3.2.1",
+    "com.unity.xr.management": "4.5.0",
+    "com.unity.xr.core-utils": "2.3.0",
+    "com.unity.xr.arfoundation": "6.0.6",
+    "com.unity.xr.hands": "1.4.3",
+    "com.unity.xr.interaction.toolkit": "2.6.5",
+    "com.xreal.xr": "file:xreal-sdk/com.xreal.xr.tar.gz",
+    "com.unity.inputsystem": "1.11.2",
+    "com.unity.textmeshpro": "3.0.9",
+    "com.unity.ugui": "2.0.0",
+    "com.unity.modules.androidjni": "1.0.0",
+    "com.unity.modules.audio": "1.0.0",
+    "com.unity.modules.video": "1.0.0",
+    "com.unity.modules.jsonserialize": "1.0.0",
+    "com.unity.modules.unitywebrequest": "1.0.0",
+    "com.unity.modules.unitywebrequesttexture": "1.0.0",
+    "com.unity.modules.imageconversion": "1.0.0",
+    "com.unity.modules.subsystems": "1.0.0"
+  },
+  "_comment_xreal": "E49: XREAL SDK 3.1.0 installed as a local tarball (Packages/xreal-sdk/, git-ignored — proprietary, user-provided). The glasses build enables the XREAL_SDK_PRESENT define (AndroidBuildXreal). PhoneOnly build leaves it off."
+}

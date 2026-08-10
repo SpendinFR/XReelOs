@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Camera frames are supplied by Unity/XREAL; this library opens no camera or
+     microphone itself. Runtime permissions remain owned by the host app. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

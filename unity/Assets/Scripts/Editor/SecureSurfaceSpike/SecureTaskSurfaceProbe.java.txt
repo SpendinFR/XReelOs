@@ -1,0 +1,87 @@
+package com.mlomega.xr.securesurface;
+
+import android.util.Log;
+import android.view.Surface;
+import android.view.SurfaceControl;
+
+/**
+ * Very small native capability probe for the isolated v15 experiment.
+ *
+ * It does not display, capture or decode protected content. It only asks the
+ * Android compositor whether the protected XREAL Surface can parent a
+ * SurfaceControl hierarchy. A positive result is required before attempting
+ * the much more invasive TaskOrganizer bridge.
+ */
+public final class SecureTaskSurfaceProbe {
+    private static final String TAG = "MLOmegaSecureTaskProbe";
+    private static boolean libraryLoaded;
+
+    static {
+        try {
+            System.loadLibrary("mlomega_secure_task_probe");
+            libraryLoaded = true;
+        } catch (Throwable error) {
+            libraryLoaded = false;
+            Log.e(TAG, "native library unavailable", error);
+        }
+    }
+
+    private SecureTaskSurfaceProbe() {}
+
+    public static String probe(Surface surface) {
+        if (!libraryLoaded) return "native_library_unavailable";
+        if (surface == null || !surface.isValid()) return "surface_invalid";
+        try {
+            String result = nativeProbe(surface);
+            Log.i(TAG, "result=" + result);
+            return result;
+        } catch (Throwable error) {
+            String result = error.getClass().getSimpleName() + ": " + error.getMessage();
+            Log.e(TAG, "probe failed: " + result, error);
+            return "exception:" + result;
+        }
+    }
+
+    public static String attachMirror(
+            Surface surface,
+            SurfaceControl mirror,
+            int sourceWidth,
+            int sourceHeight,
+            int targetWidth,
+            int targetHeight) {
+        if (!libraryLoaded) return "native_library_unavailable";
+        if (surface == null || !surface.isValid()) return "surface_invalid";
+        if (mirror == null || !mirror.isValid()) return "mirror_invalid";
+        try {
+            String result = nativeAttachMirror(
+                    surface,
+                    mirror,
+                    Math.max(1, sourceWidth),
+                    Math.max(1, sourceHeight),
+                    Math.max(1, targetWidth),
+                    Math.max(1, targetHeight));
+            Log.i(TAG, "attach=" + result);
+            return result;
+        } catch (Throwable error) {
+            String result = error.getClass().getSimpleName() + ": " + error.getMessage();
+            Log.e(TAG, "mirror attach failed: " + result, error);
+            return "exception:" + result;
+        }
+    }
+
+    public static void releaseMirrorParent() {
+        if (!libraryLoaded) return;
+        try { nativeReleaseMirrorParent(); }
+        catch (Throwable error) { Log.w(TAG, "mirror parent release failed", error); }
+    }
+
+    private static native String nativeProbe(Surface surface);
+    private static native String nativeAttachMirror(
+            Surface surface,
+            SurfaceControl mirror,
+            int sourceWidth,
+            int sourceHeight,
+            int targetWidth,
+            int targetHeight);
+    private static native void nativeReleaseMirrorParent();
+}

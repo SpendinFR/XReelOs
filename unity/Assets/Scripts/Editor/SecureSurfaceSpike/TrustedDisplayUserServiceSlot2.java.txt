@@ -1,0 +1,9 @@
+package com.mlomega.xr.securesurface;
+
+import android.content.Context;
+
+/** Dedicated Shizuku component for the second simultaneous Android-app window. */
+public final class TrustedDisplayUserServiceSlot2 extends TrustedDisplayUserService {
+    public TrustedDisplayUserServiceSlot2() { super(); }
+    public TrustedDisplayUserServiceSlot2(Context context) { super(context); }
+}

@@ -1,0 +1,28 @@
+{
+    "name": "MLOmega.XR.Reflex",
+    "rootNamespace": "MLOmega.XR.Reflex",
+    "references": [
+        "MLOmega.Contracts",
+        "MLOmega.XR.Scene",
+        "MLOmega.XR.Core",
+        "MLOmega.XR.Transport",
+        "MLOmega.XR.UI"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.nuget.newtonsoft-json",
+            "expression": "3.0.0",
+            "define": "NEWTONSOFT_JSON"
+        }
+    ],
+    "noEngineReferences": false
+}

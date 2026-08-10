@@ -1,0 +1,34 @@
+{
+    "name": "MLOmega.XR.UI",
+    "rootNamespace": "MLOmega.XR.UI",
+    "references": [
+        "MLOmega.Contracts",
+        "MLOmega.XR.Scene",
+        "MLOmega.XR.Core",
+        "MLOmega.XR.Transport",
+        "Unity.TextMeshPro",
+        "UnityEngine.UI",
+        "Unity.InputSystem",
+        "UnityEngine.UnityWebRequestTextureModule",
+        "UnityEngine.VideoModule",
+        "Unity.RenderPipelines.Universal.Runtime",
+        "Unity.RenderPipelines.Core.Runtime"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.nuget.newtonsoft-json",
+            "expression": "3.0.0",
+            "define": "NEWTONSOFT_JSON"
+        }
+    ],
+    "noEngineReferences": false
+}

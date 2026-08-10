@@ -1,0 +1,27 @@
+{
+    "name": "MLOmega.XR.Core",
+    "rootNamespace": "MLOmega.XR.Core",
+    "references": [
+        "Unity.TextMeshPro",
+        "Unity.InputSystem",
+        "MLOmega.Contracts",
+        "GUID:2b1cc58b5fab727499169f06e9336a3b"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.nuget.newtonsoft-json",
+            "expression": "3.0.0",
+            "define": "NEWTONSOFT_JSON"
+        }
+    ],
+    "noEngineReferences": false
+}

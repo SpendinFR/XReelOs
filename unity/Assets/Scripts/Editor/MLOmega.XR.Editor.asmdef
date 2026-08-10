@@ -1,0 +1,31 @@
+{
+    "name": "MLOmega.XR.Editor",
+    "rootNamespace": "MLOmega.XR.Editor",
+    "references": [
+        "MLOmega.XR.Core",
+        "MLOmega.XR.UI",
+        "MLOmega.XR.Scene",
+        "MLOmega.XR.Transport",
+        "MLOmega.XR.Reflex",
+        "MLOmega.Contracts",
+        "Unity.TextMeshPro",
+        "UnityEngine.UI",
+        "Unity.InputSystem",
+        "Unity.XR.CoreUtils",
+        "Unity.XR.Management",
+        "Unity.XR.Management.Editor",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

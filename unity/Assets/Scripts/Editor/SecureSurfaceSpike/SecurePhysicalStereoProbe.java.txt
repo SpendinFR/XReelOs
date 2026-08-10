@@ -1,0 +1,189 @@
+package com.mlomega.xr.securesurface;
+
+import android.app.Activity;
+import android.app.Presentation;
+import android.content.Context;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.Display;
+import android.view.Gravity;
+import android.view.SurfaceHolder;
+import android.view.SurfaceControl;
+import android.view.SurfaceView;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Isolated go/no-go probe for a DRM-preserving stereo compositor path.
+ *
+ * The XREAL Unity quad is a buffer consumer and cannot parent SurfaceControl.
+ * A real SurfaceView hosted by a Presentation on the physical secure XREAL
+ * display may have different compositor capabilities. v16 proved that both
+ * SurfaceViews are valid SurfaceControl parents. v17 keeps the two secure
+ * parents alive and hands their parcelable handles to the Shizuku/shell task
+ * organizer. It never captures media pixels.
+ */
+public final class SecurePhysicalStereoProbe {
+    private static final String TAG = "MLOmegaPhysicalStereo";
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static Presentation activePresentation;
+
+    private SecurePhysicalStereoProbe() {}
+
+    public static void start(Activity activity) {
+        if (activity == null) return;
+        activity.runOnUiThread(() -> startOnUiThread(activity));
+    }
+
+    private static void startOnUiThread(Activity activity) {
+        dismissActive();
+        Display target = findPhysicalXrealDisplay(activity);
+        if (target == null) {
+            Log.e(TAG, "result=physical_xreal_display_missing");
+            return;
+        }
+
+        try {
+            ProbePresentation presentation = new ProbePresentation(activity, target);
+            activePresentation = presentation;
+            presentation.show();
+            Log.i(TAG, "presentation_shown displayId=" + target.getDisplayId()
+                    + " name=" + target.getName()
+                    + " mode=" + target.getMode().getPhysicalWidth()
+                    + "x" + target.getMode().getPhysicalHeight()
+                    + " flags=0x" + Integer.toHexString(target.getFlags()));
+        } catch (Throwable error) {
+            Log.e(TAG, "result=presentation_failed:" + error.getClass().getSimpleName()
+                    + ":" + String.valueOf(error.getMessage()), error);
+            dismissActive();
+        }
+    }
+
+    private static Display findPhysicalXrealDisplay(Activity activity) {
+        DisplayManager manager = (DisplayManager) activity.getSystemService(
+                Context.DISPLAY_SERVICE);
+        if (manager == null) return null;
+
+        Display best = null;
+        for (Display display : manager.getDisplays()) {
+            String name = String.valueOf(display.getName());
+            String normalized = name.toLowerCase(Locale.ROOT);
+            Display.Mode mode = display.getMode();
+            Log.i(TAG, "candidate displayId=" + display.getDisplayId()
+                    + " name=" + name
+                    + " mode=" + mode.getPhysicalWidth() + "x"
+                    + mode.getPhysicalHeight()
+                    + " flags=0x" + Integer.toHexString(display.getFlags()));
+            if (!normalized.contains("xreal")) continue;
+            if (normalized.contains("mlomega") || normalized.contains("trusted video")) {
+                continue;
+            }
+            if ((display.getFlags() & Display.FLAG_SECURE) == 0) continue;
+            if (best == null || mode.getPhysicalWidth() > best.getMode().getPhysicalWidth()) {
+                best = display;
+            }
+        }
+        return best;
+    }
+
+    private static void dismissActive() {
+        Presentation presentation = activePresentation;
+        activePresentation = null;
+        if (presentation == null) return;
+        try {
+            presentation.dismiss();
+        } catch (Throwable ignored) {
+            // Best effort: this is a short-lived capability probe.
+        }
+    }
+
+    private static final class ProbePresentation extends Presentation {
+        private final AtomicInteger completed = new AtomicInteger();
+        private SurfaceControl leftParent;
+        private SurfaceControl rightParent;
+
+        ProbePresentation(Context context, Display display) {
+            super(context, display);
+        }
+
+        @Override
+        protected void onCreate(android.os.Bundle savedInstanceState) {
+            super.onCreate(savedInstanceState);
+            Window window = getWindow();
+            if (window != null) {
+                window.setBackgroundDrawableResource(android.R.color.transparent);
+                window.setDimAmount(0f);
+                window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                window.setFormat(PixelFormat.TRANSLUCENT);
+            }
+
+            FrameLayout root = new FrameLayout(getContext());
+            root.setBackgroundColor(Color.TRANSPARENT);
+            int eyeWidth = Math.max(1, getDisplay().getMode().getPhysicalWidth() / 2);
+            int eyeHeight = Math.max(1, getDisplay().getMode().getPhysicalHeight());
+            addProbeSurface(root, "left", Gravity.START | Gravity.TOP,
+                    eyeWidth, eyeHeight);
+            addProbeSurface(root, "right", Gravity.END | Gravity.TOP,
+                    eyeWidth, eyeHeight);
+            setContentView(root, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+
+        private void addProbeSurface(
+                FrameLayout root,
+                String eye,
+                int gravity,
+                int width,
+                int height) {
+            SurfaceView view = new SurfaceView(getContext());
+            view.setZOrderMediaOverlay(true);
+            view.getHolder().setFormat(PixelFormat.TRANSLUCENT);
+            view.getHolder().setFixedSize(width, height);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                    width, height, gravity);
+            root.addView(view, params);
+            view.getHolder().addCallback(new SurfaceHolder.Callback() {
+                @Override
+                public void surfaceCreated(SurfaceHolder holder) {
+                    String result = SecureTaskSurfaceProbe.probe(holder.getSurface());
+                    Log.i(TAG, "result=" + eye + ":" + result);
+                    SurfaceControl parent = view.getSurfaceControl();
+                    if ("left".equals(eye)) leftParent = parent;
+                    else rightParent = parent;
+                    if (completed.incrementAndGet() >= 2) {
+                        if (leftParent != null && leftParent.isValid()
+                                && rightParent != null && rightParent.isValid()) {
+                            SecureWidevinePlayer.attachPhysicalStereoParents(
+                                    leftParent,
+                                    rightParent,
+                                    getDisplay().getDisplayId(),
+                                    width,
+                                    height);
+                        } else {
+                            Log.e(TAG, "result=surface_control_parent_handle_invalid");
+                        }
+                    }
+                }
+
+                @Override
+                public void surfaceChanged(
+                        SurfaceHolder holder, int format, int width, int height) {}
+
+                @Override
+                public void surfaceDestroyed(SurfaceHolder holder) {}
+            });
+        }
+    }
+}

@@ -1,0 +1,68 @@
+# Unity generated files
+unity/[Ll]ibrary/
+unity/[Tt]emp/
+unity/[Oo]bj/
+unity/[Bb]uild/
+unity/[Bb]uilds/
+unity/[Ll]ogs/
+unity/[Uu]ser[Ss]ettings/
+unity/.utmp/
+unity/*.log
+unity/*.csproj
+unity/*.sln
+unity/.vs/
+
+# Proprietary XREAL SDK (download separately)
+unity/Packages/xreal-sdk/
+*.tar.gz
+*.tgz
+
+# Private/product-only modules intentionally excluded from the community OS
+unity/android/livetransport/
+unity/android/reflexvision/libs/
+unity/android/**/.gradle/
+unity/android/**/build/
+unity/Assets/Tests/
+unity/Assets/Tests.meta
+unity/Assets/Config/
+unity/Assets/Config.meta
+unity/Assets/StreamingAssets/models/
+unity/Assets/StreamingAssets/models.meta
+unity/Assets/Samples/
+unity/Assets/Samples.meta
+unity/Assets/Scenes/PhoneOnly.unity
+unity/Assets/Scenes/PhoneOnly.unity.meta
+unity/Assets/Scenes/XrealWorldCreator.unity
+unity/Assets/Scenes/XrealWorldCreator.unity.meta
+
+# The public ReflexVision module is deliberately hand-tracking only. These
+# historical MLOmega audio, translation and object-analysis sources are not part
+# of XReel OS and are excluded from the public tree.
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/Asr*.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/CommandWindow.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/InstantImage*.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/KeywordEncoder.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/MarianTokenizer.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/MicForegroundService.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/OfflineTranslator*.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/PcmFeed.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/SemanticSound*.kt
+unity/android/reflexvision/src/main/java/com/mlomega/xr/reflexvision/WakeWordMatcher.kt
+unity/android/reflexvision/src/test/java/com/mlomega/xr/reflexvision/CommandWindowTest.kt
+unity/android/reflexvision/src/test/java/com/mlomega/xr/reflexvision/KeywordEncoderTest.kt
+unity/android/reflexvision/src/test/java/com/mlomega/xr/reflexvision/MarianTokenizerTest.kt
+unity/android/reflexvision/src/test/java/com/mlomega/xr/reflexvision/OfflineTranslator*.kt
+unity/android/reflexvision/src/test/java/com/mlomega/xr/reflexvision/WakeWordMatcherTest.kt
+
+# Local tools and device output
+.idea/
+.vscode/
+*.keystore
+*.jks
+captures/
+recordings/
+
+# APKs are published intentionally only from releases/
+unity/*.apk
+unity/**/*.apk
+!releases/*.apk

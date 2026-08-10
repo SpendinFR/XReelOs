@@ -1,0 +1,4 @@
+releases/*.apk filter=lfs diff=lfs merge=lfs -text
+*.unity text eol=lf
+*.cs text eol=lf
+*.md text eol=lf

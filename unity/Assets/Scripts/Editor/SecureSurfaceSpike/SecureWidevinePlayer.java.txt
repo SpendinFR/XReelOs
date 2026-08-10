@@ -1,0 +1,2753 @@
+package com.mlomega.xr.securesurface;
+
+import android.app.Activity;
+import android.app.Presentation;
+import android.media.AudioManager;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.RectF;
+import android.graphics.drawable.ColorDrawable;
+import android.hardware.display.DisplayManager;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Parcel;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Display;
+import android.view.Gravity;
+import android.view.Surface;
+import android.view.SurfaceControl;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+
+import androidx.media3.common.C;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
+
+import com.mlomega.xr.lens.XrealLensControlBridge;
+
+import rikka.shizuku.Shizuku;
+
+/**
+ * Protected-display transport shared only by the isolated spike and the
+ * package-gated Browser Lab build. Product, Atelier and PhoneOnly never compile
+ * or package this source.
+ */
+@UnstableApi
+public final class SecureWidevinePlayer {
+    private static final String TAG = "MLOmegaSecureSurface";
+    private static volatile String status = "WIDEVINE: initialisation";
+    private static ExoPlayer player;
+    private static IBinder trustedService;
+    private static boolean trustedServiceBound;
+    private static Activity pendingActivity;
+    private static Surface pendingSurface;
+    private static int pendingWidth;
+    private static int pendingHeight;
+    private static int pendingDensityDpi;
+    private static String pendingPackageName;
+    private static String pendingVideoUri;
+    private static Shizuku.UserServiceArgs trustedServiceArgs;
+    private static int trustedDisplayId = -1;
+    private static long pointerDownTime;
+    private static CursorPresentation cursorPresentation;
+    private static CursorView cursorView;
+    private static SurfaceControl physicalLeftParent;
+    private static SurfaceControl physicalRightParent;
+    private static int physicalEyeWidth;
+    private static int physicalEyeHeight;
+    private static int physicalDisplayId = -1;
+    private static boolean physicalTaskRequested;
+    private static volatile boolean systemCinemaActive;
+    private static volatile boolean systemDesktopActive;
+    private static volatile boolean cinemaDisplaySwitchPending;
+    private static int previousXrealDisplayMode = -1;
+    private static volatile String activePackageName = "com.google.android.youtube";
+    private static int cinemaProbeGeneration;
+    private static volatile boolean cinemaPlaybackArmed;
+    private static View cinemaPhoneOverlay;
+    private static CinemaDockPresentation cinemaDockPresentation;
+    private static CinemaDockView cinemaDockView;
+    private static int cinemaDockDownIndex = -1;
+    private static DesktopDockPresentation desktopDockPresentation;
+    private static DesktopDockView desktopDockView;
+    private static int desktopDockDownIndex = -1;
+    private static int cinemaProjectionPreset;
+    private static int cinemaBrightnessDirection = 1;
+    private static int cinemaEcDirection = 1;
+    private static volatile boolean runtimePreflightOnly;
+
+    // PortalPad's Samsung/Android 16 proven flag word. Do not add SECURE here:
+    // uid=shell lacks CAPTURE_SECURE_VIDEO_OUTPUT on stock Android. The XREAL
+    // destination Surface remains protected; this display hosts public apps.
+    // PUBLIC|PRESENTATION|OWN_CONTENT_ONLY|SCALING_DISABLED|
+    // ROTATES_WITH_CONTENT|DESTROY_CONTENT_ON_REMOVAL|TRUSTED|
+    // OWN_DISPLAY_GROUP|ALWAYS_UNLOCKED|OWN_FOCUS|DEVICE_DISPLAY_GROUP.
+    private static final int TRUSTED_APP_DISPLAY_FLAGS = 0xDD4B;
+    private static final int SECURE_TASK_INPUT_WIDTH = 1080;
+    private static final int SECURE_TASK_INPUT_HEIGHT = 607;
+
+    private static final ServiceConnection TRUSTED_CONNECTION = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            if (binder == null || !binder.pingBinder()) {
+                status = "SHIZUKU: service trusted invalide";
+                return;
+            }
+            trustedService = binder;
+            trustedServiceBound = true;
+            if (runtimePreflightOnly) {
+                finishRuntimePreflight();
+                return;
+            }
+            // Validated v14 path: applications first live inside the protected,
+            // world-locked Unity window. Commercial playback can later retarget
+            // the physical panel without changing this navigation path.
+            createTrustedDisplayAndLaunch();
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            trustedService = null;
+            trustedServiceBound = false;
+            status = "SHIZUKU: service trusted deconnecte";
+        }
+    };
+
+    private SecureWidevinePlayer() {}
+
+    /**
+     * Starts the shell-side runtime once at Lab boot. Besides proving Shizuku is
+     * alive, constructing the fresh UserService reaps abandoned MLOmega sibling
+     * services and their VirtualDisplays from interrupted/old APK sessions.
+     * No Android application or XREAL display mode is changed here.
+     */
+    public static void prepareRuntime(Activity activity) {
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
+            try {
+                if (!Shizuku.pingBinder()) {
+                    status = "SHIZUKU: demarrage requis apres reboot";
+                    Log.w(TAG, "RUNTIME_PREFLIGHT " + status);
+                    showShortToast(activity, status);
+                    return;
+                }
+                if (Shizuku.checkSelfPermission()
+                        != PackageManager.PERMISSION_GRANTED) {
+                    status = "SHIZUKU: autorisation requise";
+                    Shizuku.requestPermission(9107);
+                    showShortToast(activity, status);
+                    return;
+                }
+                if (trustedServiceBound || trustedServiceArgs != null) return;
+                pendingActivity = activity;
+                pendingSurface = null;
+                runtimePreflightOnly = true;
+                trustedServiceArgs = new Shizuku.UserServiceArgs(
+                        new ComponentName(
+                                activity.getPackageName(),
+                                TrustedDisplayUserService.class.getName()))
+                        .daemon(false)
+                        .processNameSuffix("mlomega_trusted")
+                        .debuggable(false)
+                        .version(12);
+                Shizuku.bindUserService(trustedServiceArgs, TRUSTED_CONNECTION);
+            } catch (Throwable error) {
+                runtimePreflightOnly = false;
+                status = "PREFLIGHT EXCEPTION: " + error.getClass().getSimpleName();
+                Log.e(TAG, status, error);
+            }
+        });
+    }
+
+    private static void finishRuntimePreflight() {
+        final IBinder binder = trustedService;
+        final Shizuku.UserServiceArgs args = trustedServiceArgs;
+        new Thread(() -> {
+            String receipt = "FAIL:no_service";
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                binder.transact(
+                        TrustedDisplayUserService.TRANSACTION_RUNTIME_PREFLIGHT,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+                receipt = reply.readString();
+            } catch (Throwable error) {
+                Log.e(TAG, "runtime preflight transaction failed", error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+            Log.i(TAG, "RUNTIME_PREFLIGHT " + receipt);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                try {
+                    if (args != null)
+                        Shizuku.unbindUserService(args, TRUSTED_CONNECTION, true);
+                } catch (Throwable error) {
+                    Log.w(TAG, "runtime preflight unbind failed", error);
+                }
+                trustedService = null;
+                trustedServiceBound = false;
+                trustedServiceArgs = null;
+                runtimePreflightOnly = false;
+            }, 220L);
+        }, "mlomega-runtime-preflight").start();
+    }
+
+    private static void showShortToast(Activity activity, String message) {
+        try {
+            android.widget.Toast.makeText(
+                    activity, message, android.widget.Toast.LENGTH_LONG).show();
+        } catch (Throwable ignored) {}
+    }
+
+    public static void start(
+            Activity activity,
+            Surface surface,
+            String manifestUri,
+            String licenseUri) {
+        activity.runOnUiThread(() -> {
+            try {
+                releaseInternal();
+                status = "WIDEVINE: creation lecteur";
+
+                DefaultTrackSelector trackSelector = new DefaultTrackSelector(activity);
+                trackSelector.setParameters(
+                        trackSelector.buildUponParameters()
+                                .setPreferredVideoMimeType(MimeTypes.VIDEO_H264));
+                player = new ExoPlayer.Builder(activity)
+                        .setTrackSelector(trackSelector)
+                        .build();
+                player.setVideoSurface(surface);
+                player.setRepeatMode(Player.REPEAT_MODE_ONE);
+                player.addListener(new Player.Listener() {
+                    @Override
+                    public void onPlaybackStateChanged(int state) {
+                        if (state == Player.STATE_BUFFERING) {
+                            status = "WIDEVINE: chargement";
+                        } else if (state == Player.STATE_READY) {
+                            status = "WIDEVINE: PRET / SECURE DECODER";
+                            Log.i(TAG, "Widevine player READY on XREAL protected Surface");
+                        } else if (state == Player.STATE_ENDED) {
+                            status = "WIDEVINE: termine";
+                        }
+                    }
+
+                    @Override
+                    public void onPlayerError(PlaybackException error) {
+                        status = "WIDEVINE ERREUR " + error.errorCode + ": "
+                                + String.valueOf(error.getMessage());
+                        Log.e(TAG, status, error);
+                    }
+                });
+
+                MediaItem.DrmConfiguration drm =
+                        new MediaItem.DrmConfiguration.Builder(C.WIDEVINE_UUID)
+                                .setLicenseUri(licenseUri)
+                                .setForceDefaultLicenseUri(true)
+                                .build();
+                MediaItem mediaItem = new MediaItem.Builder()
+                        .setUri(manifestUri)
+                        .setMimeType("application/dash+xml")
+                        .setDrmConfiguration(drm)
+                        .build();
+
+                player.setMediaItem(mediaItem);
+                player.prepare();
+                player.play();
+                Log.i(TAG, "Widevine request started: " + manifestUri);
+            } catch (Throwable error) {
+                status = "WIDEVINE EXCEPTION: " + error.getClass().getSimpleName()
+                        + ": " + String.valueOf(error.getMessage());
+                Log.e(TAG, status, error);
+            }
+        });
+    }
+
+    public static String getStatus() {
+        return status;
+    }
+
+    public static boolean resizeApplicationDisplay(
+            int width,
+            int height,
+            int densityDpi) {
+        IBinder binder = trustedService;
+        if (binder == null || !binder.pingBinder() || trustedDisplayId < 0)
+            return false;
+        int safeWidth = Math.max(640, Math.min(1920, width));
+        int safeHeight = Math.max(360, Math.min(1600, height));
+        int safeDpi = Math.max(160, densityDpi);
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(safeWidth);
+            data.writeInt(safeHeight);
+            data.writeInt(safeDpi);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_RESIZE_DISPLAY,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean resized = reply.readInt() != 0;
+            if (resized) {
+                pendingWidth = safeWidth;
+                pendingHeight = safeHeight;
+                pendingDensityDpi = safeDpi;
+                status = "APP DISPLAY " + safeWidth + "x" + safeHeight;
+            }
+            return resized;
+        } catch (Throwable error) {
+            Log.e(TAG, "app display resize failed", error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /**
+     * Launches the real YouTube Android application on a secure/trusted display
+     * created by a minimal Shizuku UserService. Its independent display/focus
+     * group keeps Unity/XREAL resumed while YouTube is active.
+     */
+    public static void startYoutubeDisplay(
+            Activity activity,
+            Surface surface,
+            int width,
+            int height,
+            int densityDpi,
+            String videoUri) {
+        startApplicationDisplay(
+                activity,
+                surface,
+                width,
+                height,
+                densityDpi,
+                "com.google.android.youtube",
+                videoUri);
+    }
+
+    /** Starts one explicitly requested Android application on the validated
+     * trusted display. This avoids launching a hidden YouTube task before a
+     * Netflix-only Lab window. */
+    public static void startApplicationDisplay(
+            Activity activity,
+            Surface surface,
+            int width,
+            int height,
+            int densityDpi,
+            String packageName,
+            String launchUri) {
+        activity.runOnUiThread(() -> {
+            try {
+                releaseInternal(true);
+                pendingActivity = activity;
+                pendingSurface = surface;
+                pendingWidth = Math.max(640, width);
+                pendingHeight = Math.max(360, height);
+                pendingDensityDpi = Math.max(160, densityDpi);
+                pendingPackageName = packageName == null
+                        ? "com.google.android.youtube"
+                        : packageName.trim();
+                pendingVideoUri = launchUri;
+
+                if (!Shizuku.pingBinder()) {
+                    status = "SHIZUKU: service non demarre";
+                    return;
+                }
+                if (Shizuku.checkSelfPermission()
+                        != PackageManager.PERMISSION_GRANTED) {
+                    status = "SHIZUKU: autorisation requise sur le telephone";
+                    Shizuku.requestPermission(9107);
+                    return;
+                }
+
+                status = "SHIZUKU: connexion display trusted";
+                trustedServiceArgs = new Shizuku.UserServiceArgs(
+                        new ComponentName(
+                                activity.getPackageName(),
+                                TrustedDisplayUserService.class.getName()))
+                        .daemon(false)
+                        .processNameSuffix("mlomega_trusted")
+                        .debuggable(false)
+                        .version(12);
+                Shizuku.bindUserService(trustedServiceArgs, TRUSTED_CONNECTION);
+            } catch (Throwable error) {
+                status = "YOUTUBE EXCEPTION: " + error.getClass().getSimpleName()
+                        + ": " + String.valueOf(error.getMessage());
+                Log.e(TAG, status, error);
+            }
+        });
+    }
+
+    public static void attachPhysicalStereoParents(
+            SurfaceControl left,
+            SurfaceControl right,
+            int displayId,
+            int eyeWidth,
+            int eyeHeight) {
+        // Retained only so the previous isolated probe still compiles. v25 no
+        // longer opens physical Presentation parents: XREAL's protected quad is
+        // the single stereo/world-space parent.
+        if (left != null) try { left.release(); } catch (Throwable ignored) {}
+        if (right != null) try { right.release(); } catch (Throwable ignored) {}
+        Log.i(TAG, "legacy physical stereo callback ignored by spatial v25");
+    }
+
+    private static void maybeStartSpatialSecureTask() {
+        IBinder binder = trustedService;
+        if (physicalTaskRequested || binder == null
+                || pendingSurface == null || !pendingSurface.isValid()) {
+            return;
+        }
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            physicalTaskRequested = true;
+            physicalDisplayId = Display.DEFAULT_DISPLAY;
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            pendingSurface.writeToParcel(data, 0);
+            data.writeInt(pendingWidth);
+            data.writeInt(pendingHeight);
+            data.writeString("com.netflix.mediaclient");
+            data.writeString("https://www.netflix.com/browse");
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_START_SECURE_STEREO_TASK,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String result = reply.readString();
+            status = "NETFLIX SECURE TASK: " + result;
+            Log.i(TAG, status);
+        } catch (Throwable error) {
+            physicalTaskRequested = false;
+            status = "SECURE TASK EXCEPTION: " + error.getClass().getSimpleName()
+                    + ": " + String.valueOf(error.getMessage());
+            Log.e(TAG, status, error);
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static void createTrustedDisplayAndLaunch() {
+        IBinder binder = trustedService;
+        if (binder == null || pendingSurface == null) return;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeString("MLOmega XREAL trusted video app");
+            data.writeInt(pendingWidth);
+            data.writeInt(pendingHeight);
+            data.writeInt(pendingDensityDpi);
+            data.writeInt(TRUSTED_APP_DISPLAY_FLAGS);
+            pendingSurface.writeToParcel(data, 0);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_CREATE,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            int displayId = reply.readInt();
+            if (displayId < 0) {
+                throw new IllegalStateException("trusted display id=" + displayId);
+            }
+            trustedDisplayId = displayId;
+
+            data.recycle();
+            reply.recycle();
+            data = Parcel.obtain();
+            reply = Parcel.obtain();
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            data.writeString(pendingPackageName);
+            data.writeString(pendingVideoUri);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_LAUNCH_APP,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String launch = reply.readString();
+            activePackageName = pendingPackageName;
+            status = providerLabel(activePackageName) + ": TRUSTED DISPLAY " + displayId;
+            Log.i(TAG, status + " launch=" + launch);
+            showCursorPresentation(displayId, 8);
+        } catch (Throwable error) {
+            status = "YOUTUBE TRUSTED EXCEPTION: "
+                    + error.getClass().getSimpleName() + ": " + error.getMessage();
+            Log.e(TAG, status, error);
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean pointerDown(float x, float y) {
+        if (systemCinemaActive) {
+            if (systemDesktopActive) {
+                DesktopDockView dock = desktopDockView;
+                desktopDockDownIndex = dock == null ? -1 : dock.hitTest(x, y);
+                if (dock != null) dock.setPressed(desktopDockDownIndex);
+                if (desktopDockDownIndex >= 0) return true;
+                pointerDownTime = SystemClock.uptimeMillis();
+                return sendPointer(0, x, y, pointerDownTime);
+            }
+            CinemaDockView dock = cinemaDockView;
+            cinemaDockDownIndex = dock == null ? -1 : dock.hitTest(x, y);
+            if (dock != null) dock.setPressed(cinemaDockDownIndex);
+            return cinemaDockDownIndex >= 0;
+        }
+        if (cinemaDisplaySwitchPending) {
+            setCursorPresentationVisible(false, false);
+            return false;
+        }
+        pointerDownTime = SystemClock.uptimeMillis();
+        // Samsung rejects cross-UID injected touches whenever our cursor
+        // Presentation overlaps the target app, even though the window is
+        // NOT_TOUCHABLE and below Android's documented 0.8 opacity limit.
+        // Hide only that visual overlay for the duration of the gesture;
+        // this restores the exact touch path proven by v8.
+        setCursorPresentationVisible(false, true);
+        boolean sent = sendPointer(0, x, y, pointerDownTime);
+        if (!sent) {
+            pointerDownTime = 0L;
+            setCursorPresentationVisible(true, false);
+            updateCursor(x, y, false);
+        }
+        return sent;
+    }
+
+    public static boolean pointerMove(float x, float y) {
+        if (systemCinemaActive) {
+            if (systemDesktopActive) {
+                DesktopDockView dock = desktopDockView;
+                if (dock != null) dock.updatePointer(x, y);
+                if (desktopDockDownIndex >= 0) return true;
+                return pointerDownTime > 0L &&
+                        sendPointer(2, x, y, pointerDownTime);
+            }
+            CinemaDockView dock = cinemaDockView;
+            if (dock != null) dock.updatePointer(x, y);
+            return cinemaDockDownIndex >= 0;
+        }
+        if (cinemaDisplaySwitchPending) return false;
+        if (pointerDownTime <= 0L) return false;
+        return sendPointer(2, x, y, pointerDownTime);
+    }
+
+    public static boolean pointerUp(float x, float y) {
+        if (systemCinemaActive) {
+            if (systemDesktopActive) {
+                DesktopDockView dock = desktopDockView;
+                int released = dock == null ? -1 : dock.hitTest(x, y);
+                int action = released == desktopDockDownIndex ? released : -1;
+                desktopDockDownIndex = -1;
+                if (dock != null) dock.setPressed(-1);
+                if (action >= 0) {
+                    pointerDownTime = 0L;
+                    performDesktopDockAction(action);
+                    return true;
+                }
+                long down = pointerDownTime;
+                pointerDownTime = 0L;
+                return down > 0L && sendPointer(1, x, y, down);
+            }
+            CinemaDockView dock = cinemaDockView;
+            int released = dock == null ? -1 : dock.hitTest(x, y);
+            int action = released == cinemaDockDownIndex ? released : -1;
+            cinemaDockDownIndex = -1;
+            if (dock != null) dock.setPressed(-1);
+            if (action >= 0) performCinemaDockAction(action);
+            return action >= 0;
+        }
+        long down = pointerDownTime;
+        pointerDownTime = 0L;
+        if (down <= 0L) return false;
+        boolean sent = sendPointer(1, x, y, down);
+        updateCursor(x, y, false);
+        setCursorPresentationVisible(true, false);
+        if (sent && isCommercialVideoProvider(activePackageName)) {
+            scheduleAutomaticCinemaProbe(0);
+        }
+        return sent;
+    }
+
+    public static boolean pointerCancel(float x, float y) {
+        if (systemCinemaActive) {
+            if (!systemDesktopActive) return false;
+            desktopDockDownIndex = -1;
+            DesktopDockView dock = desktopDockView;
+            if (dock != null) dock.setPressed(-1);
+            long desktopDown = pointerDownTime;
+            pointerDownTime = 0L;
+            return desktopDown > 0L && sendPointer(3, x, y, desktopDown);
+        }
+        if (cinemaDisplaySwitchPending) return false;
+        long down = pointerDownTime;
+        pointerDownTime = 0L;
+        if (down <= 0L) return false;
+        boolean sent = sendPointer(3, x, y, down);
+        updateCursor(x, y, false);
+        setCursorPresentationVisible(true, false);
+        return sent;
+    }
+
+    public static boolean pointerHover(float x, float y) {
+        if (systemCinemaActive) {
+            if (systemDesktopActive) {
+                DesktopDockView dock = desktopDockView;
+                if (dock != null) dock.updatePointer(x, y);
+                return true;
+            }
+            CinemaDockView dock = cinemaDockView;
+            if (dock != null) dock.updatePointer(x, y);
+            return true;
+        }
+        if (cinemaDisplaySwitchPending) {
+            return false;
+        }
+        updateCursor(x, y, false);
+        IBinder binder = trustedService;
+        int displayId = activeInputDisplayId();
+        if (binder == null || !binder.pingBinder() || displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            if (physicalTaskRequested) {
+                x *= SECURE_TASK_INPUT_WIDTH / (float) Math.max(1, pendingWidth);
+                y *= SECURE_TASK_INPUT_HEIGHT / (float) Math.max(1, pendingHeight);
+            }
+            data.writeFloat(x);
+            data.writeFloat(y);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_HOVER,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "pointer hover send failed", error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean openKeyboard() {
+        IBinder binder = trustedService;
+        int displayId = activeInputDisplayId();
+        if (binder == null || !binder.pingBinder() || displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_OPEN_KEYBOARD,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "keyboard request failed", error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean inputText(String text) {
+        return transactHostedInput(
+                TrustedDisplayUserService.TRANSACTION_INPUT_TEXT,
+                text,
+                0);
+    }
+
+    public static boolean inputKey(int keyCode) {
+        return transactHostedInput(
+                TrustedDisplayUserService.TRANSACTION_INPUT_KEY,
+                null,
+                keyCode);
+    }
+
+    public static boolean clearText() {
+        return transactHostedInput(
+                TrustedDisplayUserService.TRANSACTION_CLEAR_TEXT,
+                null,
+                0);
+    }
+
+    private static boolean transactHostedInput(
+            int transaction,
+            String text,
+            int keyCode) {
+        IBinder binder = trustedService;
+        int displayId = activeInputDisplayId();
+        if (binder == null || !binder.pingBinder() || displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            if (transaction == TrustedDisplayUserService.TRANSACTION_INPUT_TEXT)
+                data.writeString(text);
+            else
+                data.writeInt(keyCode);
+            binder.transact(transaction, data, reply, 0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "hosted input failed transaction=" + transaction, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean launchApp(String packageName, String uri) {
+        IBinder binder = trustedService;
+        int displayId = trustedDisplayId;
+        if (binder == null || !binder.pingBinder() || displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            data.writeString(packageName);
+            data.writeString(uri);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_LAUNCH_APP,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String launch = reply.readString();
+            status = "APP: " + packageName + " DISPLAY " + displayId;
+            Log.i(TAG, status + " launch=" + launch);
+            boolean launched = launch != null && launch.contains("exit=0");
+            if (launched) {
+                activePackageName = packageName;
+                cinemaProbeGeneration++;
+            }
+            return launched;
+        } catch (Throwable error) {
+            Log.e(TAG, "app launch failed package=" + packageName, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    /** Rebinds the existing trusted VirtualDisplay to a freshly-created XREAL
+     * protected quad after the DP mode switch invalidated the old compositor
+     * surface. The Android task/display is intentionally preserved. */
+    public static boolean reattachTrustedSurface(
+            Surface surface,
+            int width,
+            int height) {
+        IBinder binder = trustedService;
+        if (binder == null || !binder.pingBinder()
+                || surface == null || !surface.isValid()) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            pendingSurface = surface;
+            pendingWidth = width;
+            pendingHeight = height;
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            surface.writeToParcel(data, 0);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_REATTACH_SURFACE,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean attached = reply.readInt() != 0;
+            Log.i(TAG, "trusted surface reattach=" + attached
+                    + " size=" + width + "x" + height);
+            return attached;
+        } catch (Throwable error) {
+            Log.e(TAG, "trusted surface reattach failed", error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static String setCinemaProjection(int preset) {
+        IBinder binder = trustedService;
+        if (binder == null || !binder.pingBinder()) return "FAIL:no_service";
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(preset);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_SET_CINEMA_PROJECTION,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String result = reply.readString();
+            Log.i(TAG, "cinema projection preset=" + preset + " -> " + result);
+            return result;
+        } catch (Throwable error) {
+            Log.e(TAG, "cinema projection request failed", error);
+            return "FAIL:" + error.getClass().getSimpleName();
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static boolean recenterCinemaProjection() {
+        cinemaProjectionPreset = 0;
+        String result = setCinemaProjection(0);
+        return result != null && (result.startsWith("OK:")
+                || result.startsWith("STARTED:")
+                || result.startsWith("ALREADY:"));
+    }
+
+    /** Explicit fallback exposed to the Unity "TV" handle. Automatic entry is
+     * attempted after each confirmed pinch while a protected provider is open. */
+    public static void enterCinemaMode() {
+        final int generation = ++cinemaProbeGeneration;
+        new Thread(() -> {
+            if (generation != cinemaProbeGeneration) return;
+            requestSystemCinema(true);
+        }, "mlomega-cinema-force").start();
+    }
+
+    /** Dedicated interactive desktop handoff. It shares only the validated XREAL
+     * display-mode primitive with cinema; it has no playback preflight, no media
+     * controls and never changes Unity's hand/head interaction policy. */
+    public static boolean enterDesktopMode() {
+        final int generation = ++cinemaProbeGeneration;
+        new Thread(() -> {
+            if (generation != cinemaProbeGeneration) return;
+            requestSystemDesktop();
+        }, "mlomega-desktop-force").start();
+        return true;
+    }
+
+    public static void exitCinemaMode() {
+        new Thread(SecureWidevinePlayer::stopSystemCinema,
+                "mlomega-cinema-return").start();
+    }
+
+    private static void scheduleAutomaticCinemaProbe(int ignored) {
+        final int generation = ++cinemaProbeGeneration;
+        scheduleAutomaticCinemaProbe(generation, 0);
+    }
+
+    private static void scheduleAutomaticCinemaProbe(
+            final int generation,
+            final int attempt) {
+        if (attempt >= 5 || systemCinemaActive) return;
+        long[] delays = {550L, 900L, 1400L, 2200L, 3400L};
+        new Handler(Looper.getMainLooper()).postDelayed(() ->
+                new Thread(() -> {
+                    if (generation != cinemaProbeGeneration || systemCinemaActive)
+                        return;
+                    boolean started = requestSystemCinema(false);
+                    if (!started && generation == cinemaProbeGeneration) {
+                        scheduleAutomaticCinemaProbe(generation, attempt + 1);
+                    }
+                }, "mlomega-cinema-probe").start(), delays[attempt]);
+    }
+
+    /**
+     * Once XREAL accepts the 3D->2D switch, poll the physical panel quickly
+     * instead of falling back to the progressively slower playback probe. The
+     * unavoidable system-mirror transition is therefore kept to the shortest
+     * hardware-ready interval.
+     */
+    private static void scheduleCinemaHandoffAfterDisplaySwitch(
+            final int generation,
+            final int attempt) {
+        if (attempt >= 30 || systemCinemaActive
+                || generation != cinemaProbeGeneration) return;
+        new Handler(Looper.getMainLooper()).postDelayed(() ->
+                new Thread(() -> {
+                    if (systemCinemaActive || generation != cinemaProbeGeneration)
+                        return;
+                    boolean started = requestSystemCinema(false);
+                    if (!started && generation == cinemaProbeGeneration) {
+                        scheduleCinemaHandoffAfterDisplaySwitch(
+                                generation, attempt + 1);
+                    }
+                }, "mlomega-cinema-display-ready").start(), 120L);
+    }
+
+    private static void scheduleDesktopHandoffAfterDisplaySwitch(
+            final int generation,
+            final int attempt) {
+        if (attempt >= 30 || systemCinemaActive
+                || generation != cinemaProbeGeneration) return;
+        new Handler(Looper.getMainLooper()).postDelayed(() ->
+                new Thread(() -> {
+                    if (systemCinemaActive || generation != cinemaProbeGeneration)
+                        return;
+                    boolean started = requestSystemDesktop();
+                    if (!started && generation == cinemaProbeGeneration) {
+                        scheduleDesktopHandoffAfterDisplaySwitch(
+                                generation, attempt + 1);
+                    }
+                }, "mlomega-desktop-display-ready").start(), 120L);
+    }
+
+    private static boolean requestSystemDesktop() {
+        IBinder binder = trustedService;
+        int virtualId = trustedDisplayId;
+        Activity activity = pendingActivity;
+        if (binder == null || !binder.pingBinder()
+                || virtualId < 0 || activity == null) return false;
+        setCursorPresentationVisible(false, true);
+        activity.runOnUiThread(() -> showCinemaPhoneBlackCover(activity));
+        if (!ensureDesktopDisplayMode2D(activity)) {
+            return false;
+        }
+        int glassesId = resolveGlassesDisplayId(activity);
+        if (glassesId < 0) {
+            status = "BUREAU: ecran XREAL introuvable";
+            return false;
+        }
+
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(glassesId);
+            data.writeInt(virtualId);
+            data.writeString(activePackageName);
+            data.writeInt(1);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_MAYBE_START_SYSTEM_MIRROR,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String result = reply.readString();
+            Log.i(TAG, "desktop handoff -> " + result);
+            if (result == null || (!result.startsWith("STARTED:")
+                    && !result.startsWith("ALREADY:"))) {
+                status = "BUREAU: " + result;
+                activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+                return false;
+            }
+
+            systemDesktopActive = true;
+            systemCinemaActive = true;
+            cinemaPlaybackArmed = false;
+            cinemaDisplaySwitchPending = false;
+            physicalDisplayId = glassesId;
+            status = "BUREAU SYSTEME: " + providerLabel(activePackageName);
+            setCursorPresentationVisible(false, true);
+            showDesktopDock(virtualId, 8);
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return true;
+        } catch (Throwable error) {
+            status = "BUREAU EXCEPTION: " + error.getClass().getSimpleName();
+            Log.e(TAG, "desktop handoff failed", error);
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static boolean requestSystemCinema(boolean force) {
+        IBinder binder = trustedService;
+        int virtualId = trustedDisplayId;
+        Activity activity = pendingActivity;
+        if (binder == null || !binder.pingBinder()
+                || virtualId < 0 || activity == null) return false;
+        // Do not tear down the validated XR session while Netflix is still
+        // opening its player. The old order switched the glasses to 2D first,
+        // then discovered WAIT:not_playing and stranded the transition card on
+        // the panel. Probe through the shell UserService while XR is intact;
+        // the existing 3D->2D handoff below remains byte-for-byte unchanged.
+        if (!force && !cinemaPlaybackArmed) {
+            if (!isCinemaPlaybackReady(binder, activePackageName)) {
+                status = "CINEMA: attente lecture " + providerLabel(activePackageName);
+                return false;
+            }
+            // Keep this proof across the short DP transition: Android may pause
+            // the media session while XREAL changes mode, but that must not
+            // invalidate the readiness established immediately beforehand.
+            cinemaPlaybackArmed = true;
+        }
+        // Hide the ordinary phone UI before One-series 2D briefly mirrors it.
+        // The protected panel handoff below then replaces that transition card
+        // with Netflix while the phone keeps the DRM-safe return control.
+        setCursorPresentationVisible(false, true);
+        activity.runOnUiThread(() -> showCinemaPhoneBlackCover(activity));
+        if (!ensureCinemaDisplayMode2D(activity)) {
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return false;
+        }
+        int glassesId = resolveGlassesDisplayId(activity);
+        if (glassesId < 0) {
+            status = "CINEMA: ecran XREAL introuvable";
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return false;
+        }
+
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(glassesId);
+            data.writeInt(virtualId);
+            data.writeString(activePackageName);
+            data.writeInt((force || cinemaPlaybackArmed) ? 1 : 0);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_MAYBE_START_SYSTEM_MIRROR,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            String result = reply.readString();
+            Log.i(TAG, "cinema handoff force=" + force + " -> " + result);
+            if (result == null || (!result.startsWith("STARTED:")
+                    && !result.startsWith("ALREADY:"))) {
+                if (force) status = "CINEMA: " + result;
+                activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+                return false;
+            }
+
+            systemCinemaActive = true;
+            cinemaPlaybackArmed = false;
+            cinemaDisplaySwitchPending = false;
+            physicalDisplayId = glassesId;
+            status = "CINEMA SYSTEME: " + providerLabel(activePackageName);
+            // A visible cross-UID Presentation makes commercial providers treat
+            // the output as capture. Remove it for the whole DRM handoff.
+            setCursorPresentationVisible(false, true);
+            showCinemaDock(virtualId, 8);
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return true;
+        } catch (Throwable error) {
+            status = "CINEMA EXCEPTION: " + error.getClass().getSimpleName();
+            Log.e(TAG, "cinema handoff failed", error);
+            activity.runOnUiThread(() -> showCinemaPhoneOverlay(activity));
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static boolean isCinemaPlaybackReady(
+            IBinder binder,
+            String packageName) {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeString(packageName);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_IS_PLAYBACK_READY,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            boolean ready = reply.readInt() != 0;
+            Log.i(TAG, "cinema preflight playing=" + ready
+                    + " package=" + packageName);
+            return ready;
+        } catch (Throwable error) {
+            Log.e(TAG, "cinema playback preflight failed", error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private static void stopSystemCinema() {
+        cinemaPlaybackArmed = false;
+        // While the panel is still in 2D it mirrors the phone. Replace the
+        // interactive return card with a neutral black cover before stopping
+        // the system mirror; a delay alone only exposed that phone UI longer.
+        Activity transitionActivity = pendingActivity;
+        if (transitionActivity != null) {
+            transitionActivity.runOnUiThread(
+                    SecureWidevinePlayer::coverCinemaPhoneOverlayForReturn);
+        }
+        dismissCinemaDock();
+        dismissDesktopDock();
+        IBinder binder = trustedService;
+        String result = "SKIP:no_service";
+        if (binder != null && binder.pingBinder()) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                binder.transact(
+                        TrustedDisplayUserService.TRANSACTION_STOP_SYSTEM_MIRROR,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+                result = reply.readString();
+            } catch (Throwable error) {
+                result = "FAIL:" + error.getClass().getSimpleName();
+                Log.e(TAG, "cinema return failed", error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        }
+        Log.i(TAG, "cinema return -> " + result);
+        cinemaProbeGeneration++;
+        Activity activity = pendingActivity;
+        int restoreMode = previousXrealDisplayMode > 1
+                ? previousXrealDisplayMode : 5;
+        prepareXrealDisplaySwitch();
+        boolean switchAccepted = XrealLensControlBridge.setDisplayMode(restoreMode);
+        Log.i(TAG, "cinema 3D restore requested mode=" + restoreMode
+                + " accepted=" + switchAccepted);
+        if (activity == null) {
+            finishCinemaReturn(null);
+            return;
+        }
+        final int generation = cinemaProbeGeneration;
+        scheduleCinemaReturnReady(activity, restoreMode, generation, 0);
+    }
+
+    private static boolean ensureCinemaDisplayMode2D(Activity activity) {
+        int mode = XrealLensControlBridge.getDisplayMode();
+        if (mode == 1) {
+            cinemaDisplaySwitchPending = false;
+            return hasPhysicalGlassesDisplay2D(activity);
+        }
+        if (cinemaDisplaySwitchPending) return false;
+        if (mode < 0) {
+            status = "CINEMA: mode XREAL illisible";
+            Log.w(TAG, status);
+            return false;
+        }
+
+        previousXrealDisplayMode = mode;
+        cinemaDisplaySwitchPending = true;
+        setCursorPresentationVisible(false, true);
+        prepareXrealDisplaySwitch();
+        boolean accepted = XrealLensControlBridge.setDisplayMode(1);
+        Log.i(TAG, "cinema 2D requested previous=" + mode
+                + " accepted=" + accepted);
+        if (!accepted) {
+            cinemaDisplaySwitchPending = false;
+            setCursorPresentationVisible(true, false);
+            status = "CINEMA: bascule 2D refusee";
+        } else {
+            status = "CINEMA: passage 1080p 2D";
+            scheduleCinemaHandoffAfterDisplaySwitch(
+                    cinemaProbeGeneration, 0);
+        }
+        return false;
+    }
+
+    private static boolean ensureDesktopDisplayMode2D(Activity activity) {
+        int mode = XrealLensControlBridge.getDisplayMode();
+        if (mode == 1) {
+            cinemaDisplaySwitchPending = false;
+            return hasPhysicalGlassesDisplay2D(activity);
+        }
+        if (cinemaDisplaySwitchPending) return false;
+        if (mode < 0) {
+            status = "BUREAU: mode XREAL illisible";
+            Log.w(TAG, status);
+            return false;
+        }
+        previousXrealDisplayMode = mode;
+        cinemaDisplaySwitchPending = true;
+        setCursorPresentationVisible(false, true);
+        prepareXrealDisplaySwitch();
+        boolean accepted = XrealLensControlBridge.setDisplayMode(1);
+        Log.i(TAG, "desktop 2D requested previous=" + mode
+                + " accepted=" + accepted);
+        if (!accepted) {
+            cinemaDisplaySwitchPending = false;
+            setCursorPresentationVisible(true, false);
+            status = "BUREAU: bascule 2D refusee";
+        } else {
+            status = "BUREAU: passage 1080p 2D";
+            scheduleDesktopHandoffAfterDisplaySwitch(
+                    cinemaProbeGeneration, 0);
+        }
+        return false;
+    }
+
+    private static void prepareXrealDisplaySwitch() {
+        // XREAL 3.1 assumes NRFakeActivity is alive. After a long Unity session
+        // One UI may already have destroyed it: prepareDynamicSwitchDP then
+        // throws, but broadcastDynamicSwitchDP is still the operation that lets
+        // the hardware expose its real 1920x1080 2D panel. Never skip that
+        // broadcast because the optional fake-activity move failed.
+        try {
+            Class<?> app = Class.forName("ai.nreal.activitylife.NRXRApp");
+            java.lang.reflect.Method prepare = app.getDeclaredMethod(
+                    "prepareDynamicSwitchDP");
+            prepare.setAccessible(true);
+            prepare.invoke(null);
+            Log.i(TAG, "XREAL dynamic DP fake-activity prepared");
+        } catch (Throwable error) {
+            Log.w(TAG, "XREAL fake-activity DP preparation unavailable", error);
+        }
+        try {
+            Class<?> app = Class.forName("ai.nreal.activitylife.NRXRApp");
+            java.lang.reflect.Method broadcast = app.getDeclaredMethod(
+                    "broadcastDynamicSwitchDP");
+            broadcast.setAccessible(true);
+            broadcast.invoke(null);
+            Log.i(TAG, "XREAL dynamic DP broadcast sent");
+        } catch (Throwable error) {
+            Log.w(TAG, "XREAL dynamic DP broadcast unavailable", error);
+        }
+    }
+
+    private static void scheduleCinemaReturnReady(
+            Activity activity,
+            int restoreMode,
+            int generation,
+            int attempt) {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (generation != cinemaProbeGeneration) return;
+            int mode = XrealLensControlBridge.getDisplayMode();
+            boolean physicalReady = hasPhysicalGlassesDisplay(
+                    activity, 3000, 1000);
+            if ((mode == restoreMode && physicalReady) || attempt >= 24) {
+                Log.i(TAG, "cinema XR ready mode=" + mode
+                        + " physicalReady=" + physicalReady
+                        + " attempts=" + attempt);
+                finishCinemaReturn(activity);
+                return;
+            }
+            scheduleCinemaReturnReady(
+                    activity, restoreMode, generation, attempt + 1);
+        }, attempt == 0 ? 350L : 200L);
+    }
+
+    private static void finishCinemaReturn(Activity activity) {
+        systemCinemaActive = false;
+        systemDesktopActive = false;
+        cinemaPlaybackArmed = false;
+        cinemaDisplaySwitchPending = false;
+        physicalDisplayId = -1;
+        previousXrealDisplayMode = -1;
+        status = "MLOMEGA 3D: session restauree";
+        if (activity != null) {
+            activity.runOnUiThread(() -> relaunchXrealActivity(activity));
+            new Handler(Looper.getMainLooper()).postDelayed(
+                    () -> {
+                        notifyUnityCinemaReturned();
+                        setCursorPresentationVisible(true, false);
+                    }, 1200L);
+            // Once Unity has recreated the XREAL quad, the physical panel no
+            // longer mirrors display 0. Only then remove the phone-side cover.
+            new Handler(Looper.getMainLooper()).postDelayed(
+                    SecureWidevinePlayer::removeCinemaPhoneOverlay,
+                    2800L);
+        }
+    }
+
+    private static void notifyUnityCinemaReturned() {
+        try {
+            Class<?> unity = Class.forName("com.unity3d.player.UnityPlayer");
+            java.lang.reflect.Method send = unity.getMethod(
+                    "UnitySendMessage", String.class, String.class, String.class);
+            send.invoke(
+                    null,
+                    "MLOmega World Atelier",
+                    "OnCinemaReturned",
+                    "");
+            Log.i(TAG, "Unity cinema-return reattach requested");
+        } catch (Throwable error) {
+            Log.e(TAG, "Unity cinema-return notification failed", error);
+        }
+    }
+
+    private static void requestCinemaGlassesRecenter() {
+        new Thread(() -> {
+            try {
+                String result =
+                        com.mlomega.xr.lens.XrealLensControlBridge.recenterGlasses();
+                Log.i(TAG, "cinema GlassesControl recenter -> " + result);
+            } catch (Throwable error) {
+                Log.e(TAG, "cinema GlassesControl recenter failed", error);
+            }
+        }, "mlomega-cinema-recenter").start();
+    }
+
+    private static void relaunchXrealActivity(Activity activity) {
+        try {
+            android.content.Intent intent = new android.content.Intent();
+            intent.setClassName(
+                    activity.getPackageName(),
+                    "ai.nreal.activitylife.NRXRActivity");
+            intent.addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                    android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP |
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.startActivity(intent);
+            Log.i(TAG, "XREAL NRXRActivity relaunched after cinema");
+        } catch (Throwable error) {
+            Log.e(TAG, "XREAL activity relaunch failed", error);
+        }
+    }
+
+    private static boolean hasPhysicalGlassesDisplay(
+            Activity activity,
+            int minimumWidth,
+            int minimumHeight) {
+        DisplayManager manager = (DisplayManager) activity.getSystemService(
+                Context.DISPLAY_SERVICE);
+        if (manager == null) return false;
+        for (Display display : manager.getDisplays()) {
+            if (display == null || display.getDisplayId() == Display.DEFAULT_DISPLAY)
+                continue;
+            String name = String.valueOf(display.getName()).toLowerCase();
+            if (name.contains("mlomega")) continue;
+            if (!name.contains("xreal") && !name.contains("nreal")) continue;
+            Display.Mode displayMode = display.getMode();
+            return displayMode != null
+                    && displayMode.getPhysicalWidth() >= minimumWidth
+                    && displayMode.getPhysicalHeight() >= minimumHeight;
+        }
+        return false;
+    }
+
+    private static boolean hasPhysicalGlassesDisplay2D(Activity activity) {
+        DisplayManager manager = (DisplayManager) activity.getSystemService(
+                Context.DISPLAY_SERVICE);
+        if (manager == null) return false;
+        for (Display display : manager.getDisplays()) {
+            if (display == null || display.getDisplayId() == Display.DEFAULT_DISPLAY)
+                continue;
+            String name = String.valueOf(display.getName()).toLowerCase();
+            if (name.contains("mlomega")) continue;
+            if (!name.contains("xreal") && !name.contains("nreal")) continue;
+            Display.Mode displayMode = display.getMode();
+            if (displayMode == null) return false;
+            int width = displayMode.getPhysicalWidth();
+            int height = displayMode.getPhysicalHeight();
+            return width >= 1800 && width < 3000 && height >= 1000;
+        }
+        return false;
+    }
+
+    private static int resolveGlassesDisplayId(Activity activity) {
+        DisplayManager manager = (DisplayManager) activity.getSystemService(
+                Context.DISPLAY_SERVICE);
+        if (manager == null) return -1;
+        Display fallback = null;
+        for (Display display : manager.getDisplays()) {
+            if (display == null || display.getDisplayId() == Display.DEFAULT_DISPLAY
+                    || display.getDisplayId() == trustedDisplayId) continue;
+            String name = String.valueOf(display.getName()).toLowerCase();
+            // Old trusted VirtualDisplays survive briefly across Shizuku service
+            // upgrades and their name contains "XREAL". Never confuse one with
+            // the physical glasses or restoration targets the wrong layer stack.
+            if (name.contains("mlomega")) continue;
+            if (name.contains("xreal") || name.contains("nreal")) {
+                return display.getDisplayId();
+            }
+            // Public android.view.Display has no type accessor on Unity's
+            // compile SDK. Keep a conservative non-MLOmega fallback; the XREAL
+            // name match above is the normal and hardware-validated path.
+            if (!name.contains("mlomega")) fallback = display;
+        }
+        return fallback != null ? fallback.getDisplayId() : -1;
+    }
+
+    private static boolean isCommercialVideoProvider(String packageName) {
+        return "com.netflix.mediaclient".equals(packageName)
+                || "com.amazon.avod.thirdpartyclient".equals(packageName)
+                || (packageName != null && packageName.startsWith("com.canal"));
+    }
+
+    private static String providerLabel(String packageName) {
+        if ("com.netflix.mediaclient".equals(packageName)) return "Netflix";
+        if ("com.amazon.avod.thirdpartyclient".equals(packageName)) return "Prime Video";
+        if ("com.google.android.youtube".equals(packageName)) return "YouTube";
+        if ("com.android.chrome".equals(packageName)) return "Google";
+        if ("com.spotify.music".equals(packageName)) return "Spotify";
+        if ("com.reddit.frontpage".equals(packageName)) return "Reddit";
+        if (packageName != null && packageName.startsWith("com.canal")) return "CANAL+";
+        return "video protege";
+    }
+
+    private static void showCinemaPhoneOverlay(Activity activity) {
+        removeCinemaPhoneOverlay();
+        FrameLayout root = new FrameLayout(activity);
+        root.setBackgroundColor(Color.rgb(5, 8, 14));
+
+        LinearLayout card = new LinearLayout(activity);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER);
+        card.setPadding(56, 56, 56, 56);
+
+        TextView title = new TextView(activity);
+        title.setText("Mode cinema DRM");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(28f);
+        title.setGravity(Gravity.CENTER);
+        card.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView detail = new TextView(activity);
+        detail.setText(providerLabel(activePackageName)
+                + " joue sur le grand ecran XREAL");
+        detail.setTextColor(Color.rgb(165, 180, 205));
+        detail.setTextSize(17f);
+        detail.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams detailParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        detailParams.setMargins(0, 24, 0, 52);
+        card.addView(detail, detailParams);
+
+        Button back = new Button(activity);
+        back.setText("Retour a MLOmega");
+        back.setAllCaps(false);
+        back.setTextSize(19f);
+        back.setOnClickListener(view -> exitCinemaMode());
+        card.addView(back, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 150));
+
+        FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        cardParams.setMargins(72, 72, 72, 72);
+        root.addView(card, cardParams);
+        activity.addContentView(root, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        cinemaPhoneOverlay = root;
+    }
+
+    private static void showCinemaPhoneBlackCover(Activity activity) {
+        removeCinemaPhoneOverlay();
+        FrameLayout root = new FrameLayout(activity);
+        root.setBackgroundColor(Color.BLACK);
+        activity.addContentView(root, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        cinemaPhoneOverlay = root;
+    }
+
+    private static void removeCinemaPhoneOverlay() {
+        View overlay = cinemaPhoneOverlay;
+        cinemaPhoneOverlay = null;
+        if (overlay == null) return;
+        if (overlay.getParent() instanceof ViewGroup) {
+            ((ViewGroup) overlay.getParent()).removeView(overlay);
+        }
+    }
+
+    private static void coverCinemaPhoneOverlayForReturn() {
+        View overlay = cinemaPhoneOverlay;
+        if (overlay == null) return;
+        overlay.setBackgroundColor(Color.BLACK);
+        if (overlay instanceof ViewGroup) {
+            ((ViewGroup) overlay).removeAllViews();
+        }
+    }
+
+    private static void showCinemaDock(int displayId, int retries) {
+        Activity activity = pendingActivity;
+        if (activity == null || !systemCinemaActive) return;
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (!systemCinemaActive) return;
+            try {
+                DisplayManager manager = (DisplayManager) activity.getSystemService(
+                        Context.DISPLAY_SERVICE);
+                Display display = manager == null ? null : manager.getDisplay(displayId);
+                if (display == null) {
+                    if (retries > 0) showCinemaDock(displayId, retries - 1);
+                    return;
+                }
+                dismissCinemaDock();
+                cinemaDockPresentation = new CinemaDockPresentation(activity, display);
+                cinemaDockPresentation.show();
+                cinemaDockView = cinemaDockPresentation.dock;
+                Log.i(TAG, "cinema dock ready display=" + displayId);
+            } catch (Throwable error) {
+                Log.e(TAG, "cinema dock failed display=" + displayId, error);
+            }
+        }, retries == 8 ? 250L : 180L);
+    }
+
+    private static void dismissCinemaDock() {
+        CinemaDockPresentation presentation = cinemaDockPresentation;
+        cinemaDockPresentation = null;
+        cinemaDockView = null;
+        cinemaDockDownIndex = -1;
+        if (presentation != null) {
+            try { presentation.dismiss(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void showDesktopDock(int displayId, int retries) {
+        Activity activity = pendingActivity;
+        if (activity == null || !systemDesktopActive) return;
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (!systemDesktopActive) return;
+            try {
+                DisplayManager manager = (DisplayManager) activity.getSystemService(
+                        Context.DISPLAY_SERVICE);
+                Display display = manager == null ? null : manager.getDisplay(displayId);
+                if (display == null) {
+                    if (retries > 0) showDesktopDock(displayId, retries - 1);
+                    return;
+                }
+                dismissDesktopDock();
+                desktopDockPresentation = new DesktopDockPresentation(activity, display);
+                desktopDockPresentation.show();
+                desktopDockView = desktopDockPresentation.dock;
+                Log.i(TAG, "desktop dock ready display=" + displayId);
+            } catch (Throwable error) {
+                Log.e(TAG, "desktop dock failed display=" + displayId, error);
+            }
+        }, retries == 8 ? 250L : 180L);
+    }
+
+    private static void dismissDesktopDock() {
+        DesktopDockPresentation presentation = desktopDockPresentation;
+        desktopDockPresentation = null;
+        desktopDockView = null;
+        desktopDockDownIndex = -1;
+        if (presentation != null) {
+            try { presentation.dismiss(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void performDesktopDockAction(int index) {
+        Log.i(TAG, "desktop dock action=" + index);
+        if (index >= DesktopDockView.PALETTE_ACTION_BASE) {
+            int encoded = index - DesktopDockView.PALETTE_ACTION_BASE;
+            int owner = encoded / 10;
+            int option = encoded % 10;
+            if (owner == 1) setCinemaVolumeLevel(option);
+            else if (owner == 2) stepCinemaEc(option == 0 ? -1 : 1);
+            else if (owner == 3) stepCinemaBrightness(option == 0 ? -1 : 1);
+            else if (owner == 4) {
+                cinemaProjectionPreset = Math.max(0, Math.min(2, option));
+                new Thread(
+                        () -> setCinemaProjection(cinemaProjectionPreset),
+                        "mlomega-desktop-size").start();
+            }
+            return;
+        }
+        switch (index) {
+            case 0:
+                exitCinemaMode();
+                break;
+            case 1:
+                cycleCinemaVolume();
+                break;
+            case 2:
+                stepCinemaEc();
+                break;
+            case 3:
+                stepCinemaBrightness();
+                break;
+            case 4:
+                cinemaProjectionPreset = (cinemaProjectionPreset + 1) % 3;
+                new Thread(
+                        () -> setCinemaProjection(cinemaProjectionPreset),
+                        "mlomega-desktop-size").start();
+                break;
+            case 5:
+                DesktopDockView dock = desktopDockView;
+                if (dock != null) {
+                    dock.startRecenterCountdown(
+                            SecureWidevinePlayer::requestCinemaGlassesRecenter);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    private static void performCinemaDockAction(int index) {
+        Log.i(TAG, "cinema dock action=" + index);
+        if (index >= CinemaDockView.PALETTE_ACTION_BASE) {
+            int encoded = index - CinemaDockView.PALETTE_ACTION_BASE;
+            int owner = encoded / 10;
+            int option = encoded % 10;
+            if (owner == 3) setCinemaVolumeLevel(option);
+            else if (owner == 4) stepCinemaEc(option == 0 ? -1 : 1);
+            else if (owner == 5) stepCinemaBrightness(option == 0 ? -1 : 1);
+            else if (owner == 6) {
+                cinemaProjectionPreset = Math.max(0, Math.min(2, option));
+                new Thread(
+                        () -> setCinemaProjection(cinemaProjectionPreset),
+                        "mlomega-cinema-size").start();
+            }
+            return;
+        }
+        switch (index) {
+            case 0:
+                exitCinemaMode();
+                break;
+            case 1:
+                seekCinemaBack(10000L);
+                break;
+            case 2:
+                toggleCinemaPlayback();
+                break;
+            case 3:
+                cycleCinemaVolume();
+                break;
+            case 4:
+                stepCinemaEc();
+                break;
+            case 5:
+                stepCinemaBrightness();
+                break;
+            case 6:
+                cinemaProjectionPreset = (cinemaProjectionPreset + 1) % 3;
+                new Thread(
+                        () -> setCinemaProjection(cinemaProjectionPreset),
+                        "mlomega-cinema-size").start();
+                break;
+            case 7:
+                CinemaDockView dock = cinemaDockView;
+                if (dock != null) {
+                    dock.startRecenterCountdown(
+                            SecureWidevinePlayer::requestCinemaGlassesRecenter);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    private static void toggleCinemaPlayback() {
+        IBinder binder = trustedService;
+        if (binder == null || !binder.pingBinder()) return;
+        new Thread(() -> {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                binder.transact(
+                        TrustedDisplayUserService.TRANSACTION_TOGGLE_MEDIA,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+                status = "CINEMA: lecture " + reply.readString();
+            } catch (Throwable error) {
+                Log.e(TAG, "cinema play/pause failed", error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        }, "mlomega-cinema-play-pause").start();
+    }
+
+    private static void cycleCinemaVolume() {
+        Activity activity = pendingActivity;
+        if (activity == null) return;
+        try {
+            AudioManager audio = (AudioManager) activity.getSystemService(
+                    Context.AUDIO_SERVICE);
+            if (audio == null) return;
+            int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+            int current = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int step = Math.max(1, max / 4);
+            int target = current + step > max ? 0 : Math.min(max, current + step);
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+            status = "CINEMA: volume " + target + "/" + max;
+        } catch (Throwable error) {
+            Log.w(TAG, "cinema volume failed", error);
+        }
+    }
+
+    private static void setCinemaVolumeLevel(int option) {
+        Activity activity = pendingActivity;
+        if (activity == null) return;
+        try {
+            AudioManager audio = (AudioManager) activity.getSystemService(
+                    Context.AUDIO_SERVICE);
+            if (audio == null) return;
+            int max = Math.max(1,
+                    audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+            int clamped = Math.max(0, Math.min(4, option));
+            int target = Math.round(max * (clamped / 4f));
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+            status = "CINEMA: volume " + target + "/" + max;
+            CinemaDockView dock = cinemaDockView;
+            if (dock != null) dock.invalidate();
+            DesktopDockView desktop = desktopDockView;
+            if (desktop != null) desktop.invalidate();
+        } catch (Throwable error) {
+            Log.w(TAG, "cinema volume level failed", error);
+        }
+    }
+
+    private static void seekCinemaBack(long milliseconds) {
+        IBinder binder = trustedService;
+        if (binder == null || !binder.pingBinder()) return;
+        new Thread(() -> {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                data.writeLong(milliseconds);
+                binder.transact(
+                        TrustedDisplayUserService.TRANSACTION_SEEK_MEDIA_BACK,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+                status = "CINEMA: retour " + reply.readString();
+            } catch (Throwable error) {
+                Log.e(TAG, "cinema seek back failed", error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        }, "mlomega-cinema-seek-back").start();
+    }
+
+    private static void stepCinemaBrightness() {
+        stepCinemaBrightness(cinemaBrightnessDirection);
+    }
+
+    private static void stepCinemaBrightness(int direction) {
+        String result = XrealLensControlBridge.stepBrightness(
+                direction);
+        int value = parseStateInt(result, "b");
+        int count = parseStateInt(result, "bc");
+        if (count > 0 && value >= count - 1) cinemaBrightnessDirection = -1;
+        else if (value <= 0) cinemaBrightnessDirection = 1;
+        status = "CINEMA: luminosite " + result;
+    }
+
+    private static void stepCinemaEc() {
+        stepCinemaEc(cinemaEcDirection);
+    }
+
+    private static void stepCinemaEc(int direction) {
+        String result = XrealLensControlBridge.stepEc(direction);
+        int value = parseStateInt(result, "ec");
+        int count = parseStateInt(result, "ecc");
+        if (count > 0 && value >= count - 1) cinemaEcDirection = -1;
+        else if (value <= 0) cinemaEcDirection = 1;
+        status = "CINEMA: electro " + result;
+    }
+
+    private static int parseStateInt(String value, String key) {
+        if (value == null) return -1;
+        String marker = "|" + key + "=";
+        int start = value.indexOf(marker);
+        if (start < 0) return -1;
+        start += marker.length();
+        int end = value.indexOf('|', start);
+        if (end < 0) end = value.length();
+        try { return Integer.parseInt(value.substring(start, end)); }
+        catch (Throwable ignored) { return -1; }
+    }
+
+    /** Desktop controls intentionally live in their own Presentation/View. The
+     * system-mirror transaction is shared with protected cinema because that is
+     * the XREAL panel primitive, but desktop never inherits media controls or an
+     * interaction-mode side effect. */
+    private static final class DesktopDockPresentation extends Presentation {
+        DesktopDockView dock;
+
+        DesktopDockPresentation(Context context, Display display) {
+            super(context, display);
+        }
+
+        @Override
+        protected void onCreate(android.os.Bundle state) {
+            super.onCreate(state);
+            Window window = getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setDimAmount(0f);
+                window.setFormat(PixelFormat.TRANSLUCENT);
+                window.addFlags(
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            }
+            dock = new DesktopDockView(getContext());
+            setContentView(dock);
+        }
+    }
+
+    private static final class DesktopDockView extends View {
+        static final int PALETTE_ACTION_BASE = 2000;
+        private static final int ACTION_COUNT = 6;
+        private static final String[] LABELS = {
+                "MLOMEGA", "SON", "ELECTRO", "LUM", "TAILLE", "CENTRER"};
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF[] actions = new RectF[ACTION_COUNT];
+        private final RectF[] paletteActions = new RectF[5];
+        private final Handler handler = new Handler(Looper.getMainLooper());
+        private float pointerX = -1f;
+        private float pointerY = -1f;
+        private int pressed = -1;
+        private boolean expanded;
+        private int paletteOwner = -1;
+        private int paletteCount;
+        private int recenterCountdown;
+        private float countdownX;
+        private float countdownY;
+        private long dockRevealCandidateSince;
+
+        DesktopDockView(Context context) {
+            super(context);
+            setBackgroundColor(Color.TRANSPARENT);
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+            for (int i = 0; i < actions.length; i++) actions[i] = new RectF();
+            for (int i = 0; i < paletteActions.length; i++)
+                paletteActions[i] = new RectF();
+        }
+
+        void updatePointer(float x, float y) {
+            post(() -> {
+                pointerX = x;
+                pointerY = y;
+                if (recenterCountdown > 0) {
+                    countdownX = x;
+                    countdownY = y;
+                }
+                if (y >= getHeight() * 0.84f) {
+                    long now = SystemClock.uptimeMillis();
+                    if (dockRevealCandidateSince <= 0L)
+                        dockRevealCandidateSince = now;
+                    if (now - dockRevealCandidateSince >= 280L)
+                        expanded = true;
+                } else {
+                    dockRevealCandidateSince = 0L;
+                }
+                if (y < getHeight() * 0.77f && pressed < 0) {
+                    expanded = false;
+                    paletteOwner = -1;
+                }
+                int hovered = actionAt(x, y);
+                if (hovered >= 1 && hovered <= 4) {
+                    paletteOwner = hovered;
+                } else if (!insidePaletteColumn(x, y) && pressed < 0) {
+                    paletteOwner = -1;
+                }
+                invalidate();
+            });
+        }
+
+        int hitTest(float x, float y) {
+            if (!expanded) return -1;
+            for (int i = 0; i < paletteCount; i++)
+                if (paletteActions[i].contains(x, y))
+                    return PALETTE_ACTION_BASE + paletteOwner * 10 + i;
+            return actionAt(x, y);
+        }
+
+        private int actionAt(float x, float y) {
+            for (int i = 0; i < actions.length; i++)
+                if (actions[i].contains(x, y)) return i;
+            return -1;
+        }
+
+        private boolean insidePaletteColumn(float x, float y) {
+            if (paletteOwner < 0 || paletteCount <= 0) return false;
+            RectF first = paletteActions[0];
+            RectF last = paletteActions[paletteCount - 1];
+            return x >= first.left - 18f && x <= first.right + 18f
+                    && y >= first.top - 24f && y <= last.bottom + 24f;
+        }
+
+        void setPressed(int index) {
+            post(() -> {
+                pressed = index;
+                invalidate();
+            });
+        }
+
+        void startRecenterCountdown(Runnable completion) {
+            post(() -> {
+                recenterCountdown = 3;
+                countdownX = pointerX >= 0f ? pointerX : getWidth() * .5f;
+                countdownY = pointerY >= 0f ? pointerY : getHeight() * .5f;
+                invalidate();
+                advanceRecenterCountdown(completion);
+            });
+        }
+
+        private void advanceRecenterCountdown(Runnable completion) {
+            handler.postDelayed(() -> {
+                recenterCountdown--;
+                invalidate();
+                if (recenterCountdown > 0) advanceRecenterCountdown(completion);
+                else if (completion != null) completion.run();
+            }, 1000L);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (!expanded) {
+                for (RectF action : actions) action.setEmpty();
+                for (RectF option : paletteActions) option.setEmpty();
+                paletteCount = 0;
+                // A restrained macOS-like grab indicator makes the hidden dock
+                // discoverable without covering the desktop.
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.argb(155, 210, 222, 236));
+                float cx = getWidth() * .5f;
+                float cy = getHeight() - 17f;
+                canvas.drawRoundRect(cx - 34f, cy - 3f,
+                        cx + 34f, cy + 3f, 3f, 3f, paint);
+                drawDesktopPointer(canvas);
+                drawRecenterCountdown(canvas);
+                return;
+            }
+
+            float width = getWidth();
+            float height = getHeight();
+            float itemWidth = 88f;
+            float gap = 8f;
+            float total = ACTION_COUNT * itemWidth + (ACTION_COUNT - 1) * gap;
+            float left = (width - total) * .5f;
+            float bottom = height - 30f;
+            float top = bottom - 62f;
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(178, 10, 15, 24));
+            canvas.drawRoundRect(left - 16f, top - 13f,
+                    left + total + 16f, bottom + 13f, 25f, 25f, paint);
+            paint.setTextAlign(Paint.Align.CENTER);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            for (int i = 0; i < ACTION_COUNT; i++) {
+                float x = left + i * (itemWidth + gap);
+                RectF rect = actions[i];
+                rect.set(x, top, x + itemWidth, bottom);
+                boolean hover = rect.contains(pointerX, pointerY);
+                paint.setColor(i == pressed
+                        ? Color.argb(245, 72, 211, 255)
+                        : (hover ? Color.argb(225, 49, 79, 108)
+                        : Color.argb(210, 26, 36, 52)));
+                canvas.drawRoundRect(rect, 20f, 20f, paint);
+                drawDesktopIcon(canvas, i, rect.centerX(), rect.top + 29f);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setTextSize(9.5f);
+                paint.setColor(Color.argb(235, 222, 231, 241));
+                canvas.drawText(LABELS[i], rect.centerX(), rect.bottom - 10f, paint);
+            }
+            drawControlPalette(canvas, top);
+
+            paint.setTextAlign(Paint.Align.RIGHT);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT);
+            paint.setTextSize(15f);
+            paint.setColor(Color.argb(220, 222, 231, 241));
+            String clock = new SimpleDateFormat(
+                    "HH:mm", Locale.getDefault()).format(new Date());
+            canvas.drawText(clock, left + total, top - 22f, paint);
+            drawDesktopPointer(canvas);
+            drawRecenterCountdown(canvas);
+        }
+
+        private void drawDesktopPointer(Canvas canvas) {
+            if (pointerX < 0f || pointerY < 0f) return;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(225, 5, 10, 16));
+            canvas.drawCircle(pointerX, pointerY, pressed >= 0 ? 7f : 6f, paint);
+            paint.setColor(pressed >= 0
+                    ? Color.rgb(72, 220, 255) : Color.WHITE);
+            canvas.drawCircle(pointerX, pointerY, pressed >= 0 ? 4f : 3f, paint);
+        }
+
+        private void drawControlPalette(Canvas canvas, float dockTop) {
+            paletteCount = paletteOwner == 1 ? 5
+                    : ((paletteOwner == 2 || paletteOwner == 3) ? 2
+                    : (paletteOwner == 4 ? 3 : 0));
+            for (int i = paletteCount; i < paletteActions.length; i++)
+                paletteActions[i].setEmpty();
+            if (paletteCount == 0 || paletteOwner < 0) return;
+            RectF owner = actions[paletteOwner];
+            float itemWidth = paletteOwner == 4 ? 76f : 58f;
+            float itemHeight = 42f;
+            float gap = 6f;
+            float left = owner.centerX() - itemWidth * .5f;
+            float bottom = dockTop - 12f;
+            for (int i = paletteCount - 1; i >= 0; i--) {
+                float top = bottom - itemHeight;
+                RectF option = paletteActions[i];
+                option.set(left, top, left + itemWidth, bottom);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(option.contains(pointerX, pointerY)
+                        ? Color.argb(238, 67, 102, 138)
+                        : Color.argb(225, 18, 28, 42));
+                canvas.drawRoundRect(option, 15f, 15f, paint);
+                paint.setTextAlign(Paint.Align.CENTER);
+                paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                paint.setTextSize(paletteOwner == 4 ? 10f : 13f);
+                paint.setColor(Color.WHITE);
+                String label;
+                if (paletteOwner == 1) label = String.valueOf(i * 25);
+                else if (paletteOwner == 4)
+                    label = i == 0 ? "GRAND" : (i == 1 ? "MOYEN" : "PETIT");
+                else label = i == 0 ? "-" : "+";
+                canvas.drawText(label, option.centerX(), option.centerY() + 5f, paint);
+                bottom = top - gap;
+            }
+        }
+
+        private void drawRecenterCountdown(Canvas canvas) {
+            if (recenterCountdown <= 0) return;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(205, 8, 14, 24));
+            canvas.drawCircle(countdownX, countdownY, 47f, paint);
+            paint.setTextAlign(Paint.Align.CENTER);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            paint.setTextSize(52f);
+            paint.setColor(Color.WHITE);
+            canvas.drawText(String.valueOf(recenterCountdown),
+                    countdownX, countdownY + 18f, paint);
+        }
+
+        private void drawDesktopIcon(Canvas canvas, int index, float cx, float cy) {
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(3f);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setColor(Color.WHITE);
+            if (index == 0) {
+                canvas.drawLine(cx + 10f, cy, cx - 9f, cy, paint);
+                canvas.drawLine(cx - 9f, cy, cx - 2f, cy - 7f, paint);
+                canvas.drawLine(cx - 9f, cy, cx - 2f, cy + 7f, paint);
+            } else if (index == 1) {
+                canvas.drawRect(cx - 10f, cy - 4f, cx - 5f, cy + 4f, paint);
+                canvas.drawLine(cx - 5f, cy - 4f, cx + 2f, cy - 10f, paint);
+                canvas.drawLine(cx + 2f, cy - 10f, cx + 2f, cy + 10f, paint);
+                canvas.drawLine(cx + 2f, cy + 10f, cx - 5f, cy + 4f, paint);
+                canvas.drawArc(cx - 2f, cy - 8f, cx + 14f, cy + 8f,
+                        -55f, 110f, false, paint);
+            } else if (index == 2) {
+                canvas.drawRoundRect(cx - 15f, cy - 7f, cx - 2f, cy + 6f,
+                        5f, 5f, paint);
+                canvas.drawRoundRect(cx + 2f, cy - 7f, cx + 15f, cy + 6f,
+                        5f, 5f, paint);
+                canvas.drawLine(cx - 2f, cy - 2f, cx + 2f, cy - 2f, paint);
+            } else if (index == 3) {
+                canvas.drawCircle(cx, cy, 6f, paint);
+                for (int ray = 0; ray < 8; ray++) {
+                    double a = ray * Math.PI / 4.0;
+                    canvas.drawLine(cx + (float)Math.cos(a) * 10f,
+                            cy + (float)Math.sin(a) * 10f,
+                            cx + (float)Math.cos(a) * 14f,
+                            cy + (float)Math.sin(a) * 14f, paint);
+                }
+            } else if (index == 4) {
+                canvas.drawLine(cx - 13f, cy - 5f, cx - 13f, cy - 12f, paint);
+                canvas.drawLine(cx - 13f, cy - 12f, cx - 6f, cy - 12f, paint);
+                canvas.drawLine(cx + 13f, cy + 5f, cx + 13f, cy + 12f, paint);
+                canvas.drawLine(cx + 13f, cy + 12f, cx + 6f, cy + 12f, paint);
+            } else {
+                canvas.drawCircle(cx, cy, 11f, paint);
+                canvas.drawLine(cx - 15f, cy, cx - 6f, cy, paint);
+                canvas.drawLine(cx + 6f, cy, cx + 15f, cy, paint);
+                canvas.drawLine(cx, cy - 15f, cx, cy - 6f, paint);
+                canvas.drawLine(cx, cy + 6f, cx, cy + 15f, paint);
+            }
+            paint.setStrokeCap(Paint.Cap.BUTT);
+        }
+    }
+
+    private static final class CinemaDockPresentation extends Presentation {
+        CinemaDockView dock;
+
+        CinemaDockPresentation(Context context, Display display) {
+            super(context, display);
+        }
+
+        @Override
+        protected void onCreate(android.os.Bundle state) {
+            super.onCreate(state);
+            Window window = getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setDimAmount(0f);
+                window.setFormat(PixelFormat.TRANSLUCENT);
+                window.addFlags(
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            }
+            dock = new CinemaDockView(getContext());
+            setContentView(dock);
+        }
+    }
+
+    private static final class CinemaDockView extends View {
+        static final int PALETTE_ACTION_BASE = 1000;
+        private static final int ACTION_COUNT = 8;
+        private static final String[] LABELS = {
+                "MLOMEGA", "-10 S", "LECTURE", "SON", "ELECTRO", "LUM", "TAILLE", "CENTRER"};
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF[] actions = new RectF[ACTION_COUNT];
+        private final RectF[] paletteActions = new RectF[5];
+        private final Handler handler = new Handler(Looper.getMainLooper());
+        private float pointerX = -1f;
+        private float pointerY = -1f;
+        private int pressed = -1;
+        private boolean expanded;
+        private int paletteOwner = -1;
+        private int paletteCount;
+        private int recenterCountdown;
+        private float countdownX;
+        private float countdownY;
+        private long dockRevealCandidateSince;
+
+        CinemaDockView(Context context) {
+            super(context);
+            setBackgroundColor(Color.TRANSPARENT);
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+            for (int i = 0; i < actions.length; i++) actions[i] = new RectF();
+            for (int i = 0; i < paletteActions.length; i++)
+                paletteActions[i] = new RectF();
+        }
+
+        void updatePointer(float x, float y) {
+            post(() -> {
+                pointerX = x;
+                pointerY = y;
+                if (recenterCountdown > 0) {
+                    // Follow the user's new look direction during 3..2..1. The
+                    // native recenter therefore uses the intended centre, not
+                    // the lower-right button that started the countdown.
+                    countdownX = x;
+                    countdownY = y;
+                }
+                // Keep cinema controls discreet. The old lower-third trigger was
+                // reached during ordinary viewing; require a deliberate look at
+                // the bottom 16% and retain hysteresis while interacting.
+                if (y >= getHeight() * 0.84f) {
+                    long now = SystemClock.uptimeMillis();
+                    if (dockRevealCandidateSince <= 0L)
+                        dockRevealCandidateSince = now;
+                    if (now - dockRevealCandidateSince >= 420L)
+                        expanded = true;
+                } else {
+                    dockRevealCandidateSince = 0L;
+                }
+                if (y < getHeight() * 0.77f && pressed < 0) {
+                    expanded = false;
+                    paletteOwner = -1;
+                }
+                int hoveredAction = actionAt(x, y);
+                if (hoveredAction >= 3 && hoveredAction <= 6) {
+                    paletteOwner = hoveredAction;
+                } else if (!insidePaletteColumn(x, y) && pressed < 0) {
+                    paletteOwner = -1;
+                }
+                invalidate();
+            });
+        }
+
+        int hitTest(float x, float y) {
+            if (!expanded) return -1;
+            for (int i = 0; i < paletteCount; i++)
+                if (paletteActions[i].contains(x, y))
+                    return PALETTE_ACTION_BASE + paletteOwner * 10 + i;
+            return actionAt(x, y);
+        }
+
+        private int actionAt(float x, float y) {
+            for (int i = 0; i < actions.length; i++)
+                if (actions[i].contains(x, y)) return i;
+            return -1;
+        }
+
+        private boolean insidePaletteColumn(float x, float y) {
+            if (paletteOwner < 0 || paletteCount <= 0) return false;
+            RectF first = paletteActions[0];
+            RectF last = paletteActions[paletteCount - 1];
+            return x >= first.left - 18f && x <= first.right + 18f
+                    && y >= first.top - 24f && y <= last.bottom + 24f;
+        }
+
+        void startRecenterCountdown(Runnable completion) {
+            post(() -> {
+                recenterCountdown = 3;
+                countdownX = pointerX >= 0f ? pointerX : getWidth() * .5f;
+                countdownY = pointerY >= 0f ? pointerY : getHeight() * .5f;
+                invalidate();
+                advanceRecenterCountdown(completion);
+            });
+        }
+
+        private void advanceRecenterCountdown(Runnable completion) {
+            handler.postDelayed(() -> {
+                recenterCountdown--;
+                invalidate();
+                if (recenterCountdown > 0) advanceRecenterCountdown(completion);
+                else if (completion != null) completion.run();
+            }, 1000L);
+        }
+
+        void setPressed(int index) {
+            post(() -> {
+                pressed = index;
+                invalidate();
+            });
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float width = getWidth();
+            float height = getHeight();
+            if (!expanded) {
+                // Fully hidden by design: looking at the lower reveal zone is
+                // enough to reopen it; no persistent tab remains over the film.
+                for (RectF action : actions) action.setEmpty();
+                for (RectF option : paletteActions) option.setEmpty();
+                paletteCount = 0;
+                drawRecenterCountdown(canvas);
+                return;
+            }
+
+            float itemWidth = 82f;
+            float gap = 7f;
+            float total = ACTION_COUNT * itemWidth + (ACTION_COUNT - 1) * gap;
+            float left = (width - total) * 0.5f;
+            // Keep the controls against the lower optical edge rather than as
+            // a floating block in the film image.
+            float bottom = height - 30f;
+            float top = bottom - 60f;
+            paint.setColor(Color.argb(176, 9, 14, 24));
+            canvas.drawRoundRect(
+                    left - 16f,
+                    top - 13f,
+                    left + total + 16f,
+                    bottom + 13f,
+                    24f,
+                    24f,
+                    paint);
+
+            paint.setTextAlign(Paint.Align.CENTER);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            for (int i = 0; i < ACTION_COUNT; i++) {
+                float x = left + i * (itemWidth + gap);
+                RectF rect = actions[i];
+                rect.set(x, top, x + itemWidth, bottom);
+                boolean hover = rect.contains(pointerX, pointerY);
+                paint.setColor(i == pressed
+                        ? Color.argb(245, 72, 211, 255)
+                        : (hover
+                        ? Color.argb(225, 49, 79, 108)
+                        : Color.argb(210, 26, 36, 52)));
+                canvas.drawRoundRect(rect, 19f, 19f, paint);
+
+                drawDockIcon(canvas, i, rect.centerX(), rect.top + 28f);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setTextSize(9.5f);
+                paint.setColor(Color.argb(235, 222, 231, 241));
+                canvas.drawText(LABELS[i], rect.centerX(), rect.bottom - 10f, paint);
+            }
+            drawControlPalette(canvas, top);
+
+            paint.setTextAlign(Paint.Align.RIGHT);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT);
+            paint.setTextSize(15f);
+            paint.setColor(Color.argb(220, 222, 231, 241));
+            String clock = new SimpleDateFormat(
+                    "HH:mm", Locale.getDefault()).format(new Date());
+            canvas.drawText(clock, left + total, top - 22f, paint);
+
+            if (pointerX >= 0f && pointerY >= 0f) {
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.argb(225, 5, 10, 16));
+                canvas.drawCircle(pointerX, pointerY, pressed >= 0 ? 7f : 6f, paint);
+                paint.setColor(pressed >= 0
+                        ? Color.rgb(72, 220, 255)
+                        : Color.WHITE);
+                canvas.drawCircle(pointerX, pointerY, pressed >= 0 ? 4f : 3f, paint);
+            }
+            drawRecenterCountdown(canvas);
+        }
+
+        private void drawRecenterCountdown(Canvas canvas) {
+            if (recenterCountdown > 0) {
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.argb(205, 8, 14, 24));
+                canvas.drawCircle(countdownX, countdownY, 47f, paint);
+                paint.setTextAlign(Paint.Align.CENTER);
+                paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                paint.setTextSize(52f);
+                paint.setColor(Color.WHITE);
+                canvas.drawText(String.valueOf(recenterCountdown),
+                        countdownX, countdownY + 18f, paint);
+            }
+        }
+
+        private void drawControlPalette(Canvas canvas, float dockTop) {
+            paletteCount = paletteOwner == 3 ? 5
+                    : ((paletteOwner == 4 || paletteOwner == 5) ? 2
+                    : (paletteOwner == 6 ? 3 : 0));
+            for (int i = paletteCount; i < paletteActions.length; i++)
+                paletteActions[i].setEmpty();
+            if (paletteCount == 0 || paletteOwner < 0) return;
+            RectF owner = actions[paletteOwner];
+            float itemWidth = paletteOwner == 6 ? 76f : 58f;
+            float itemHeight = 42f;
+            float gap = 6f;
+            float left = owner.centerX() - itemWidth * .5f;
+            float bottom = dockTop - 12f;
+            for (int i = paletteCount - 1; i >= 0; i--) {
+                float top = bottom - itemHeight;
+                RectF option = paletteActions[i];
+                option.set(left, top, left + itemWidth, bottom);
+                boolean hover = option.contains(pointerX, pointerY);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(hover
+                        ? Color.argb(238, 67, 102, 138)
+                        : Color.argb(225, 18, 28, 42));
+                canvas.drawRoundRect(option, 15f, 15f, paint);
+                paint.setTextAlign(Paint.Align.CENTER);
+                paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                paint.setTextSize(paletteOwner == 6 ? 10f : 13f);
+                paint.setColor(Color.WHITE);
+                String label;
+                if (paletteOwner == 3)
+                    label = String.valueOf(i * 25);
+                else if (paletteOwner == 6)
+                    label = i == 0 ? "GRAND" : (i == 1 ? "MOYEN" : "PETIT");
+                else
+                    label = i == 0 ? "−" : "+";
+                canvas.drawText(label, option.centerX(), option.centerY() + 5f, paint);
+                bottom = top - gap;
+            }
+        }
+
+        private void drawDockIcon(Canvas canvas, int index, float cx, float cy) {
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(3f);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setColor(Color.WHITE);
+            switch (index) {
+                case 0: // return
+                    canvas.drawLine(cx + 10f, cy, cx - 9f, cy, paint);
+                    canvas.drawLine(cx - 9f, cy, cx - 2f, cy - 7f, paint);
+                    canvas.drawLine(cx - 9f, cy, cx - 2f, cy + 7f, paint);
+                    break;
+                case 1: // ten seconds back
+                    canvas.drawArc(cx - 12f, cy - 12f, cx + 12f, cy + 12f,
+                            45f, 285f, false, paint);
+                    canvas.drawLine(cx - 10f, cy - 10f, cx - 15f, cy - 3f, paint);
+                    canvas.drawLine(cx - 10f, cy - 10f, cx - 3f, cy - 8f, paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setTextAlign(Paint.Align.CENTER);
+                    paint.setTextSize(8f);
+                    canvas.drawText("10", cx, cy + 3f, paint);
+                    break;
+                case 2: // play/pause
+                    canvas.drawLine(cx - 6f, cy - 8f, cx - 6f, cy + 8f, paint);
+                    canvas.drawLine(cx + 6f, cy - 8f, cx + 6f, cy + 8f, paint);
+                    break;
+                case 3: // volume
+                    canvas.drawRect(cx - 10f, cy - 4f, cx - 5f, cy + 4f, paint);
+                    canvas.drawLine(cx - 5f, cy - 4f, cx + 2f, cy - 10f, paint);
+                    canvas.drawLine(cx + 2f, cy - 10f, cx + 2f, cy + 10f, paint);
+                    canvas.drawLine(cx + 2f, cy + 10f, cx - 5f, cy + 4f, paint);
+                    canvas.drawArc(cx - 2f, cy - 8f, cx + 14f, cy + 8f,
+                            -55f, 110f, false, paint);
+                    break;
+                case 4: // electrochromic lenses
+                    canvas.drawRoundRect(cx - 15f, cy - 7f, cx - 2f, cy + 6f,
+                            5f, 5f, paint);
+                    canvas.drawRoundRect(cx + 2f, cy - 7f, cx + 15f, cy + 6f,
+                            5f, 5f, paint);
+                    canvas.drawLine(cx - 2f, cy - 2f, cx + 2f, cy - 2f, paint);
+                    break;
+                case 5: // brightness
+                    canvas.drawCircle(cx, cy, 6f, paint);
+                    for (int ray = 0; ray < 8; ray++) {
+                        double a = ray * Math.PI / 4.0;
+                        canvas.drawLine(
+                                cx + (float)Math.cos(a) * 10f,
+                                cy + (float)Math.sin(a) * 10f,
+                                cx + (float)Math.cos(a) * 14f,
+                                cy + (float)Math.sin(a) * 14f,
+                                paint);
+                    }
+                    break;
+                case 6: // size
+                    canvas.drawLine(cx - 13f, cy - 5f, cx - 13f, cy - 12f, paint);
+                    canvas.drawLine(cx - 13f, cy - 12f, cx - 6f, cy - 12f, paint);
+                    canvas.drawLine(cx + 13f, cy + 5f, cx + 13f, cy + 12f, paint);
+                    canvas.drawLine(cx + 13f, cy + 12f, cx + 6f, cy + 12f, paint);
+                    break;
+                default: // recenter
+                    canvas.drawCircle(cx, cy, 11f, paint);
+                    canvas.drawLine(cx - 15f, cy, cx - 6f, cy, paint);
+                    canvas.drawLine(cx + 6f, cy, cx + 15f, cy, paint);
+                    canvas.drawLine(cx, cy - 15f, cx, cy - 6f, paint);
+                    canvas.drawLine(cx, cy + 6f, cx, cy + 15f, paint);
+                    break;
+            }
+            paint.setStrokeCap(Paint.Cap.BUTT);
+        }
+    }
+
+    private static void showCursorPresentation(int displayId, int retries) {
+        Activity activity = pendingActivity;
+        if (activity == null) return;
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            try {
+                DisplayManager manager = (DisplayManager) activity.getSystemService(
+                        Context.DISPLAY_SERVICE);
+                Display display = manager != null ? manager.getDisplay(displayId) : null;
+                if (display == null) {
+                    if (retries > 0) showCursorPresentation(displayId, retries - 1);
+                    else Log.w(TAG, "cursor display unavailable id=" + displayId);
+                    return;
+                }
+                if (cursorPresentation != null) {
+                    try { cursorPresentation.dismiss(); } catch (Throwable ignored) {}
+                }
+                cursorPresentation = new CursorPresentation(activity, display);
+                cursorPresentation.show();
+                cursorView = cursorPresentation.cursor;
+                Log.i(TAG, "cursor presentation ready display=" + displayId);
+            } catch (Throwable error) {
+                Log.e(TAG, "cursor presentation failed display=" + displayId, error);
+            }
+        }, retries == 8 ? 900L : 250L);
+    }
+
+    private static void updateCursor(float x, float y, boolean pressed) {
+        if (systemCinemaActive || cinemaDisplaySwitchPending) return;
+        CursorView view = cursorView;
+        if (view == null) return;
+        view.post(() -> view.setPointer(x, y, pressed));
+    }
+
+    private static void setCursorPresentationVisible(
+            boolean visible,
+            boolean waitForComposition) {
+        // No cross-UID cursor/overlay is allowed while Android owns the DRM
+        // cinema output. This also prevents a late pointerUp/hover callback from
+        // making the cursor reappear over Netflix after the handoff.
+        final boolean requestedVisible = visible;
+        final boolean show = visible
+                && !systemCinemaActive
+                && !cinemaDisplaySwitchPending;
+        if (requestedVisible && !show) {
+            Log.i(TAG, "cursor show suppressed during cinema handoff");
+        }
+        Activity activity = pendingActivity;
+        CursorPresentation presentation = cursorPresentation;
+        CursorView view = cursorView;
+        if (activity == null || presentation == null) return;
+
+        Runnable update = () -> {
+            try {
+                if (view != null) {
+                    view.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
+                }
+                if (show) {
+                    // Dialog.show() after hide() restores the existing decor;
+                    // it does not recreate the Presentation or its Surface.
+                    presentation.show();
+                } else {
+                    // Alpha zero is insufficient on Samsung: InputDispatcher
+                    // keeps the Presentation in BLOCK_UNTRUSTED. hide() makes
+                    // the decor GONE and removes it from hit-test occlusion.
+                    presentation.hide();
+                }
+                Log.i(TAG, "cursor presentation visible=" + show);
+            } catch (Throwable error) {
+                Log.w(TAG, "cursor presentation visibility failed", error);
+            }
+        };
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            update.run();
+        } else if (waitForComposition) {
+            CountDownLatch applied = new CountDownLatch(1);
+            activity.runOnUiThread(() -> {
+                update.run();
+                applied.countDown();
+            });
+            try {
+                applied.await(120L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        } else {
+            activity.runOnUiThread(update);
+        }
+
+        // Samsung updates the decor visibility immediately but publishes its
+        // input-window stack later. Hardware logs showed ACTION_DOWN still
+        // seeing the stale window 11 ms after the relayout; 100 ms is the
+        // validated v13 fallback, while 60 ms keeps multiple compositor/input
+        // frames and is evaluated only in the isolated v14. Pinch-down only.
+        if (!show && waitForComposition &&
+                Looper.myLooper() != Looper.getMainLooper()) {
+            SystemClock.sleep(60L);
+        }
+    }
+
+    private static final class CursorPresentation extends Presentation {
+        CursorView cursor;
+
+        CursorPresentation(Context context, Display display) {
+            super(context, display);
+        }
+
+        @Override
+        protected void onCreate(android.os.Bundle state) {
+            super.onCreate(state);
+            Window window = getWindow();
+            if (window != null) {
+                window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                window.setDimAmount(0f);
+                window.setFormat(PixelFormat.TRANSLUCENT);
+                window.addFlags(
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                // Samsung One UI still classifies this cross-UID Presentation
+                // as BLOCK_UNTRUSTED at 0.72. The pointer bridge therefore
+                // drops it to alpha=0 only while a touch gesture is injected.
+                WindowManager.LayoutParams attributes = window.getAttributes();
+                attributes.alpha = 0.72f;
+                window.setAttributes(attributes);
+            }
+            cursor = new CursorView(getContext());
+            setContentView(cursor);
+        }
+    }
+
+    private static final class CursorView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float pointerX = -100f;
+        private float pointerY = -100f;
+        private boolean pressed;
+
+        CursorView(Context context) {
+            super(context);
+            setBackgroundColor(Color.TRANSPARENT);
+            setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        }
+
+        void setPointer(float x, float y, boolean isPressed) {
+            pointerX = x;
+            pointerY = y;
+            pressed = isPressed;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (pointerX < 0f || pointerY < 0f) return;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(210, 12, 16, 22));
+            canvas.drawCircle(pointerX, pointerY, pressed ? 17f : 14f, paint);
+            paint.setColor(Color.argb(255, 246, 249, 255));
+            canvas.drawCircle(pointerX, pointerY, pressed ? 11f : 9f, paint);
+            paint.setColor(pressed
+                    ? Color.rgb(54, 220, 255)
+                    : Color.rgb(100, 118, 142));
+            canvas.drawCircle(pointerX, pointerY, pressed ? 5f : 3.5f, paint);
+        }
+    }
+
+    private static boolean sendPointer(
+            int action,
+            float x,
+            float y,
+            long downTime) {
+        IBinder binder = trustedService;
+        int displayId = activeInputDisplayId();
+        if (binder == null || !binder.pingBinder() || displayId < 0)
+            return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+            data.writeInt(displayId);
+            data.writeInt(action);
+            if (physicalTaskRequested) {
+                x *= SECURE_TASK_INPUT_WIDTH / (float) Math.max(1, pendingWidth);
+                y *= SECURE_TASK_INPUT_HEIGHT / (float) Math.max(1, pendingHeight);
+            }
+            data.writeFloat(x);
+            data.writeFloat(y);
+            data.writeLong(downTime);
+            binder.transact(
+                    TrustedDisplayUserService.TRANSACTION_POINTER,
+                    data,
+                    reply,
+                    0);
+            reply.readException();
+            return reply.readInt() != 0;
+        } catch (Throwable error) {
+            Log.e(TAG, "pointer send failed action=" + action, error);
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    public static void release(Activity activity) {
+        activity.runOnUiThread(() -> releaseInternal(false));
+    }
+
+    public static void releaseAndStop(Activity activity) {
+        activity.runOnUiThread(() -> releaseInternal(true));
+    }
+
+    private static void releaseInternal() {
+        releaseInternal(false);
+    }
+
+    private static void releaseInternal(boolean stopHostedApplication) {
+        // Restore the native XREAL panel before the trusted VD disappears. A
+        // destroyed layer stack must never remain attached to the glasses.
+        if (systemCinemaActive) stopSystemCinema();
+        if (player != null) {
+            player.clearVideoSurface();
+            player.release();
+            player = null;
+        }
+        if (cursorPresentation != null) {
+            try { cursorPresentation.dismiss(); } catch (Throwable ignored) {}
+            cursorPresentation = null;
+            cursorView = null;
+        }
+        if (trustedService != null) {
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                if (stopHostedApplication && activePackageName != null) {
+                    String stoppedPackage = activePackageName;
+                    data.writeString(activePackageName);
+                    trustedService.transact(
+                            TrustedDisplayUserService.TRANSACTION_STOP_PACKAGE,
+                            data,
+                            reply,
+                            0);
+                    reply.readException();
+                    boolean stopped = reply.readInt() != 0;
+                    Log.i(TAG, "APP_STOP_CLIENT_RECEIPT package=" + stoppedPackage
+                            + " stopped=" + stopped);
+                    data.recycle();
+                    reply.recycle();
+                    data = Parcel.obtain();
+                    reply = Parcel.obtain();
+                    data.writeInterfaceToken(TrustedDisplayUserService.DESCRIPTOR);
+                }
+                trustedService.transact(
+                        TrustedDisplayUserService.TRANSACTION_RELEASE,
+                        data,
+                        reply,
+                        0);
+                reply.readException();
+            } catch (Throwable error) {
+                Log.w(TAG, "trusted display release failed", error);
+            } finally {
+                data.recycle();
+                reply.recycle();
+            }
+        }
+        if (trustedServiceArgs != null) {
+            try {
+                Shizuku.unbindUserService(
+                        trustedServiceArgs,
+                        TRUSTED_CONNECTION,
+                        true);
+            } catch (Throwable error) {
+                Log.w(TAG, "trusted user service unbind failed", error);
+            }
+            trustedServiceArgs = null;
+        }
+        trustedService = null;
+        trustedServiceBound = false;
+        trustedDisplayId = -1;
+        physicalDisplayId = -1;
+        physicalTaskRequested = false;
+        systemCinemaActive = false;
+        systemDesktopActive = false;
+        cinemaPlaybackArmed = false;
+        activePackageName = "com.google.android.youtube";
+        cinemaProbeGeneration++;
+        removeCinemaPhoneOverlay();
+        pointerDownTime = 0L;
+        pendingActivity = null;
+        pendingSurface = null;
+        pendingPackageName = null;
+        pendingVideoUri = null;
+    }
+
+    private static int activeInputDisplayId() {
+        return physicalTaskRequested
+                ? Display.DEFAULT_DISPLAY
+                : trustedDisplayId;
+    }
+}

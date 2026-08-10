@@ -1,0 +1,24 @@
+{
+    "name": "MLOmega.XR.Lab",
+    "rootNamespace": "MLOmega.XR.Lab",
+    "references": [
+        "MLOmega.XR.UI",
+        "MLOmega.XR.Core",
+        "MLOmega.XR.Reflex",
+        "MLOmega.XR.SecureSurfaceSpike",
+        "MLOmega.Contracts",
+        "TLab.WebView.Runtime",
+        "Unity.XR.XREAL",
+        "Unity.TextMeshPro",
+        "UnityEngine.UI"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

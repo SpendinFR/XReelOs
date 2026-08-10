@@ -1,0 +1,29 @@
+{
+    "name": "MLOmega.XR.XrealSpatial",
+    "rootNamespace": "MLOmega.XR.UI",
+    "references": [
+        "MLOmega.Contracts",
+        "MLOmega.XR.Core",
+        "MLOmega.XR.Transport",
+        "MLOmega.XR.UI",
+        "MLOmega.XR.Reflex",
+        "UnityEngine.UI",
+        "Unity.Collections",
+        "Unity.XR.ARFoundation",
+        "Unity.XR.ARSubsystems",
+        "Unity.XR.CoreUtils",
+        "Unity.XR.Hands",
+        "Unity.XR.XREAL"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "XREAL_SDK_PRESENT"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
