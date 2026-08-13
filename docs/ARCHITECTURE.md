@@ -76,6 +76,30 @@ layout selection, seek/play/pause and the two-palm exit gesture. It deliberately
 does not bypass DRM: protected Netflix/Prime playback remains in the system
 cinema path.
 
+### v2 thermal handoff
+
+The source page remains fully alive while the stream is discovered and while
+Media3 warms up. Only after the imported texture exists and reports a real video
+size does v2 enter the presenter and perform the reversible handoff:
+
+```text
+first valid Media3 frame
+  -> explicitly pause playing HTML video/audio
+  -> WebView.onPause + hide the source WebView on the phone
+  -> pause/hide TLab's source capture host
+  -> Media3 remains the sole immersive video decoder
+```
+
+The normal exit still disposes the decoder and recreates the browser from its
+saved URL/cookie store. A failed transition restores the original WebView. The
+raw-WebView fallback is intentionally unchanged because it is itself the video
+source and therefore cannot be suspended.
+
+The OS scene also consumes XREAL's native Y/U/V Eye planes directly in the
+existing MediaPipe path instead of first creating a full-resolution RGB render
+texture. If native I420 submission fails once, RGB conversion is restored for
+the rest of that session automatically.
+
 ## Rendering contract
 
 The hardware-proven XREAL template contract is retained:

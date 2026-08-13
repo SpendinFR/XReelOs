@@ -67,15 +67,21 @@ if ($buildExit -ne 0) {
     throw "Unity build failed with exit code $buildExit"
 }
 
-$apk = Join-Path $project "build\android\XReelOs.apk"
+$apk = Join-Path $project "build\android\XReelOs-v2.apk"
 if (-not (Test-Path -LiteralPath $apk)) { throw "APK was not produced: $apk" }
-$release = Join-Path $root "releases\XReelOs.apk"
+$release = Join-Path $root "releases\XReelOs-v2.apk"
 Copy-Item -LiteralPath $apk -Destination $release -Force
-$hash = Get-FileHash -LiteralPath $release -Algorithm SHA256
-$hashLine = "$($hash.Hash.ToLowerInvariant())  XReelOs.apk`n"
+$releaseFiles = @(
+    (Join-Path $root "releases\XReelOs.apk"),
+    $release
+) | Where-Object { Test-Path -LiteralPath $_ }
+$hashLines = foreach ($releaseFile in $releaseFiles) {
+    $entryHash = Get-FileHash -LiteralPath $releaseFile -Algorithm SHA256
+    "$($entryHash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($releaseFile))"
+}
 [IO.File]::WriteAllText(
     (Join-Path $root "releases\SHA256SUMS.txt"),
-    $hashLine,
+    (($hashLines -join "`n") + "`n"),
     [Text.UTF8Encoding]::new($false))
 Get-Item -LiteralPath $release
-$hash
+Get-FileHash -LiteralPath $release -Algorithm SHA256

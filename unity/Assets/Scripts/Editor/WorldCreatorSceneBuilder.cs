@@ -213,6 +213,12 @@ namespace MLOmega.XR.Editor
             Assign(creator, "_osOnlyMode", true);
             Assign(creator, "_exchange", (UnityEngine.Object)null);
 
+            var capture = root.GetComponent<EyeCaptureSource>();
+            if (capture == null)
+                throw new InvalidOperationException(
+                    "XREAL Eye capture source missing from OS scene.");
+            Assign(capture, "_preferNativeI420WithoutRgb", true);
+
             var exchange = root.GetComponent<WorldMapDocumentExchange>();
             if (exchange != null)
                 UnityEngine.Object.DestroyImmediate(exchange);

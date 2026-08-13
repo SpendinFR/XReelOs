@@ -373,6 +373,8 @@ namespace MLOmega.XR.Editor
                     PlayerSettings.SetApplicationIdentifier(
                         BuildTargetGroup.Android,
                         "com.spendinfr.xreelos");
+                    PlayerSettings.bundleVersion = "2.0.0";
+                    PlayerSettings.Android.bundleVersionCode = 2;
                     ConfigureXReelOsIcon();
                     ConfigureXrealSdkSettings();
                     EnableXrealLoader();
@@ -386,7 +388,7 @@ namespace MLOmega.XR.Editor
                         throw new Exception("[XReel OS] scene missing.");
 
                     string outPath = Path.GetFullPath(Path.Combine(
-                        "build", "android", "XReelOs.apk"));
+                        "build", "android", "XReelOs-v2.apk"));
                     Directory.CreateDirectory(Path.GetDirectoryName(outPath));
                     // Unity's incremental Android writer can preserve a stale
                     // signing/padding tail when replacing an existing APK. The

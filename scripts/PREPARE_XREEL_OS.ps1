@@ -1,6 +1,7 @@
 param(
     [string]$Serial = "",
     [switch]$InstallApk,
+    [switch]$V2ThermalCandidate,
     [switch]$NoLaunch
 )
 
@@ -25,7 +26,8 @@ function Invoke-Adb {
 Invoke-Adb wait-for-device
 
 if ($InstallApk) {
-    $apk = Join-Path $root "releases\XReelOs.apk"
+    $apkName = if ($V2ThermalCandidate) { "XReelOs-v2.apk" } else { "XReelOs.apk" }
+    $apk = Join-Path $root ("releases\" + $apkName)
     if (-not (Test-Path -LiteralPath $apk)) { throw "APK missing: $apk" }
     Invoke-Adb install -r $apk
 }

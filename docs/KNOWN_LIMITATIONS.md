@@ -85,8 +85,11 @@ code.
   authored.
 - YouTube's web player is not a universal VR source. Sites exposing a direct
   non-DRM stream are the intended path.
-- The current browser can also render on the phone while feeding the glasses.
-  Avoiding that duplicate phone presentation is a future thermal optimization.
+- In v1 the browser can also render on the phone while feeding the glasses. The
+  v2 candidate hides the source-site preview and pauses its capture host after a
+  valid Media3 immersive frame; the phone return controls remain available.
+- The v2 optimization applies only to the direct Media3 stream path. The raw
+  WebView fallback must keep rendering because that WebView texture is its source.
 - The browser is not a complete replacement for Chrome: complex pop-ups, cookie
   layers and unusual nested scrolling can remain site-specific.
 
@@ -103,6 +106,9 @@ code.
 - Moonlight quality and latency depend on Sunshine encoder settings, the PC,
   Wi-Fi/Tailscale route and decoder load. 4K is not automatically the best mobile
   profile.
+- v2 removes known duplicate work, so lower load and heat are expected, but its
+  thermal improvement has not yet been measured on hardware. Media3 high-resolution
+  decode, Unity stereo, 6DoF and 25 fps MediaPipe still consume substantial power.
 - 90 Hz, 120 Hz and sustained high-resolution VR require a complete frame-pacing,
   gesture latency and thermal validation before becoming defaults.
 
@@ -117,7 +123,7 @@ code.
 
 ## Roadmap candidates
 
-1. remove the duplicate phone presentation during immersive VR;
+1. hardware-validate the v2 VR thermal handoff and measure its temperature impact;
 2. profile a real 90 Hz path without regressing camera or gesture scheduling;
 3. add user-approved dynamic application discovery and policy selection;
 4. improve generic Android text-input compatibility;

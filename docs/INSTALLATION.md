@@ -2,7 +2,7 @@
 
 ## Validated configuration
 
-The release APK was exercised on a Galaxy S24 running Android 16 / One UI 8,
+The v1 release APK was exercised on a Galaxy S24 running Android 16 / One UI 8,
 XREAL One Pro + Eye, and the GlassesControl/ControlGlasses build displayed as
 15.1.0 on that phone. XREAL SDK 3.1.0 and current glasses firmware were used.
 
@@ -50,6 +50,16 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 & $adb install -r ".\releases\XReelOs.apk"
 .\scripts\PREPARE_XREEL_OS.ps1
 ```
+
+For the separate, not-yet-hardware-validated v2 VR thermal candidate:
+
+```powershell
+.\scripts\PREPARE_XREEL_OS.ps1 -InstallApk -V2ThermalCandidate -NoLaunch
+```
+
+The candidate uses the same package with a higher version code. Its changes are
+limited to removing duplicate browser/Eye rendering work during immersive VR;
+keep v1 as the rollback reference.
 
 With more than one ADB device, select it explicitly:
 

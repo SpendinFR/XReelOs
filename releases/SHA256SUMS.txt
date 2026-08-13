@@ -1,1 +1,2 @@
 d570f6faf89e865970d81b843b9d25485fa79ba5bf11aadef61c8229a9b27a76  XReelOs.apk
+e0fb1a5ffa1bfdef1695e108bfb054ff9b3e336a9c0de4ef28df2a9572fe3ca2  XReelOs-v2.apk

@@ -1632,6 +1632,7 @@ namespace MLOmega.XR.UI
         private bool _vrObserverInstallRequested;
         private float _nextVrObserverInstall;
         private bool _shutdownRequested;
+        private bool _vrSourcePageSuspended;
         private bool _viewportSwipeRunning;
         private float _nextFrameCopyAt;
 #if UNITY_ANDROID && !UNITY_EDITOR
@@ -2135,8 +2136,36 @@ namespace MLOmega.XR.UI
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (_nativeWebView == null) return;
+            if (_vrSourcePageSuspended == paused) return;
+            _vrSourcePageSuspended = paused;
+            AndroidJavaObject rootLayout = GetNativeField("mRootLayout");
+            AndroidJavaObject captureLayout = GetNativeField("mCaptureLayout");
+            AndroidJavaObject glSurface = GetNativeField("mGlSurfaceView");
             try
             {
+                bool bridgeQueued = false;
+                try
+                {
+                    using var bridge = new AndroidJavaClass(
+                        "com.mlomega.xr.webvr.XrWebVrBridge");
+                    bridgeQueued = bridge.CallStatic<bool>(
+                        "setSourcePageSuspended",
+                        _nativeWebView,
+                        paused,
+                        paused
+                            ? XrLabWebVrScript.SuspendSourceMedia
+                            : XrLabWebVrScript.ResumeSourceMedia);
+                }
+                catch (Exception exception)
+                {
+                    // Keep a compatibility fallback if a developer launches an
+                    // old injected bridge from Library/Bee. v2 builds always
+                    // contain setSourcePageSuspended.
+                    Debug.LogWarning(
+                        "[XrLabVR] source bridge unavailable; using WebView fallback: " +
+                        exception.GetType().Name);
+                }
+
                 using var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
                 using AndroidJavaObject activity =
                     unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
@@ -2145,9 +2174,42 @@ namespace MLOmega.XR.UI
                 {
                     try
                     {
-                        webView?.Call(paused ? "onPause" : "onResume");
-                        if (!paused)
-                            webView?.Call("postInvalidateOnAnimation");
+                        // Suspend TLab's visible/capture host as well as Chromium.
+                        // INVISIBLE preserves the exact Android layout so an abort
+                        // can restore it; normal decoded-VR exit destroys and
+                        // recreates this browser as it did in v1.
+                        if (paused)
+                        {
+                            if (!bridgeQueued)
+                            {
+                                webView?.Call("onPause");
+                                webView?.Call("setVisibility", 4); // View.INVISIBLE
+                            }
+                            try { glSurface?.Call("onPause"); }
+                            catch (Exception) { }
+                            glSurface?.Call("setVisibility", 4);
+                            captureLayout?.Call("setVisibility", 4);
+                            rootLayout?.Call("setVisibility", 4);
+                        }
+                        else
+                        {
+                            rootLayout?.Call("setVisibility", 0); // View.VISIBLE
+                            captureLayout?.Call("setVisibility", 0);
+                            glSurface?.Call("setVisibility", 0);
+                            try { glSurface?.Call("onResume"); }
+                            catch (Exception) { }
+                            if (!bridgeQueued)
+                            {
+                                webView?.Call("setVisibility", 0);
+                                webView?.Call("onResume");
+                                webView?.Call("postInvalidateOnAnimation");
+                            }
+                            rootLayout?.Call("requestLayout");
+                        }
+                        Debug.Log(
+                            paused
+                                ? "[XrLabVR] source decoder/capture host suspended after Media3 ready."
+                                : "[XrLabVR] source decoder/capture host restored after aborted handoff.");
                     }
                     catch (Exception exception)
                     {
@@ -2155,10 +2217,20 @@ namespace MLOmega.XR.UI
                             "[XrLabVR] source page pause transition failed: " +
                             exception.GetType().Name);
                     }
+                    finally
+                    {
+                        rootLayout?.Dispose();
+                        captureLayout?.Dispose();
+                        glSurface?.Dispose();
+                    }
                 }));
             }
             catch (Exception exception)
             {
+                _vrSourcePageSuspended = false;
+                rootLayout?.Dispose();
+                captureLayout?.Dispose();
+                glSurface?.Dispose();
                 Debug.LogWarning(
                     "[XrLabVR] source page pause unavailable: " +
                     exception.GetType().Name);
@@ -2661,7 +2733,6 @@ namespace MLOmega.XR.UI
             if (_decodedVrMode)
             {
                 _vrStreamTexture?.StopCapture();
-                _browser?.SetVrSourcePagePaused(false);
             }
             _nativeVrMode = false;
             _decodedVrMode = false;
@@ -3028,7 +3099,6 @@ namespace MLOmega.XR.UI
                 if (decoded)
                 {
                     _vrStreamTexture?.StopCapture();
-                    _browser?.SetVrSourcePagePaused(false);
                     yield return new WaitForEndOfFrame();
                 }
                 _vrPresenter?.Exit();

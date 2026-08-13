@@ -82,6 +82,17 @@ namespace MLOmega.XR.Core
     }
 
     /// <summary>
+    /// Optional policy exposed by adapters that already provide native Y/U/V Eye
+    /// planes. OS-only gesture builds can skip their otherwise redundant full-size
+    /// GPU RGB conversion; consumers may request RGB again at runtime if the native
+    /// path proves unavailable.
+    /// </summary>
+    public interface INativeEyeFramePolicy
+    {
+        bool ConvertNativeEyeFramesToRgb { get; set; }
+    }
+
+    /// <summary>
     /// Hardware-facing contract for the G1 gate. Implementations:
     ///   - <c>XrealDeviceAdapter</c>   : real XREAL SDK 3.1.0 (glasses + Eye).
     ///   - <c>SimulatedDeviceAdapter</c>: WebCamTexture + synthetic pose (editor).

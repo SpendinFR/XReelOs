@@ -11,13 +11,28 @@ Eye/MediaPipe interaction implementation, build scripts, troubleshooting notes
 and a ready-to-install APK. It does **not** contain the private Memory/Brain2
 backend, user data, cloud credentials, or the proprietary XREAL SDK archive.
 
-The current public source is synchronized with the hardware-validated **v52 UI
-baseline**: the complete spatial window system, Android-app/cinema bridges and
-the immersive VR browser are included rather than represented by a demo stub.
+The public source is based on the hardware-validated **v52 UI baseline**: the
+complete spatial window system, Android-app/cinema bridges and immersive VR
+browser are included rather than represented by a demo stub.
+
+## Downloads and release status
+
+- `releases/XReelOs.apk` is the original hardware-validated v1 APK.
+- `releases/XReelOs-v2.apk` is an **experimental VR thermal candidate**. It keeps
+  the v1 feature set but, only after Media3 has produced a valid immersive frame,
+  pauses the source HTML media, hides/pauses the phone WebView capture host and
+  avoids an otherwise redundant full-resolution Eye YUV-to-RGB blit. It has been
+  build- and package-validated but cannot currently be hardware-validated by the
+  maintainer. Use it specifically to test immersive-browser heat and regression;
+  do not treat it as the new stable release yet.
+
+Both APKs remain downloadable. They share the same Android package; v2 uses
+version name `2.0.0` and version code `2`, so it installs as an upgrade while the
+v1 file remains available for rollback.
 
 ## Hardware validation
 
-The current interaction baseline was tested on real hardware on 11 August 2026:
+The v1 interaction baseline was tested on real hardware on 11 August 2026:
 
 - Samsung Galaxy S24;
 - Android 16 / Samsung One UI 8;
@@ -83,6 +98,15 @@ are processed ephemerally and are not saved by the hand-tracking path.
 
    The current release size and SHA-256 are published in
    [`releases/SHA256SUMS.txt`](releases/SHA256SUMS.txt).
+
+   To test only the v2 VR thermal candidate instead:
+
+   ```powershell
+   & $adb install -r ".\releases\XReelOs-v2.apk"
+   ```
+
+   Read the [v2 thermal candidate test note](docs/RELEASE_V2_THERMAL_CANDIDATE.md)
+   before reporting results.
 
 4. Run the reproducible preflight while the phone is reachable by ADB:
 
@@ -172,8 +196,9 @@ The checked-in APK is development-signed for direct sideload testing. Forks
 intended for store or production distribution must use their own release key.
 
 The Android target is mandatory at editor startup because several XREAL SDK
-settings are compiled only under `UNITY_ANDROID`. The output is
-`unity/build/android/XReelOs.apk`. Start with the short
+settings are compiled only under `UNITY_ANDROID`. The v2 output is
+`unity/build/android/XReelOs-v2.apk`; the build script copies it without
+overwriting the v1 artifact. Start with the short
 [build guide](docs/BUILD_GUIDE.md); the complete hardware and renderer runbook
 is [Build Guide XREAL](docs/BUILD_GUIDE_XREAL.md).
 

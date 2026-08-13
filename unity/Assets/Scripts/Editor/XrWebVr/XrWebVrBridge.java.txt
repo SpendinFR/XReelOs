@@ -67,6 +67,8 @@ public final class XrWebVrBridge {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final WeakHashMap<WebView, CaptureState> CAPTURES =
             new WeakHashMap<>();
+    private static final WeakHashMap<WebView, Boolean> SOURCE_SUSPENDED =
+            new WeakHashMap<>();
 
     private static Presentation presentation;
     private static GLSurfaceView glView;
@@ -152,6 +154,65 @@ public final class XrWebVrBridge {
             CaptureState state = CAPTURES.get(view);
             return state != null && state.rejectCurrentCandidate();
         }
+    }
+
+    /**
+     * Stops the source WebView from decoding/drawing after Media3 has produced
+     * its first usable frame. WebView.onPause() alone does not pause JavaScript,
+     * hence the explicit media script supplied by Unity. This method never
+     * destroys the WebView, cookies or navigation state and is fully reversible
+     * for a failed handoff.
+     */
+    public static boolean setSourcePageSuspended(
+            WebView view,
+            boolean suspended,
+            String mediaScript) {
+        if (view == null) return false;
+        final String script = safe(mediaScript);
+        Runnable action = () -> {
+            try {
+                if (suspended) {
+                    synchronized (SOURCE_SUSPENDED) {
+                        SOURCE_SUSPENDED.put(view, Boolean.TRUE);
+                    }
+                    if (!script.isEmpty()) {
+                        view.evaluateJavascript(script, ignored -> {
+                            try {
+                                synchronized (SOURCE_SUSPENDED) {
+                                    if (!Boolean.TRUE.equals(SOURCE_SUSPENDED.get(view)))
+                                        return;
+                                }
+                                view.onPause();
+                                view.setVisibility(View.INVISIBLE);
+                                Log.i(TAG, "source HTML media paused; phone preview hidden");
+                            } catch (Throwable error) {
+                                Log.w(TAG, "source suspend callback failed: " +
+                                        error.getClass().getSimpleName());
+                            }
+                        });
+                    } else {
+                        view.onPause();
+                        view.setVisibility(View.INVISIBLE);
+                    }
+                } else {
+                    synchronized (SOURCE_SUSPENDED) {
+                        SOURCE_SUSPENDED.put(view, Boolean.FALSE);
+                    }
+                    view.setVisibility(View.VISIBLE);
+                    view.onResume();
+                    if (!script.isEmpty()) view.evaluateJavascript(script, null);
+                    view.requestLayout();
+                    view.postInvalidateOnAnimation();
+                    Log.i(TAG, "source WebView restored after aborted VR handoff");
+                }
+            } catch (Throwable error) {
+                Log.w(TAG, "source page suspension failed: " +
+                        error.getClass().getSimpleName());
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else MAIN.post(action);
+        return true;
     }
 
     public static boolean start(

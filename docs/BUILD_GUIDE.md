@@ -56,8 +56,9 @@ by Git, just like the proprietary XREAL SDK archive.
 
 `BUILD_XREEL_OS.ps1` deliberately runs Unity twice. Pass 1 imports the local
 XREAL/AR Foundation packages and sets `XREAL_SDK_PRESENT`; pass 2 compiles and
-packages the real XREAL adapter. It then copies the verified artifact to
-`releases/XReelOs.apk` and regenerates `releases/SHA256SUMS.txt`.
+packages the real XREAL adapter. It then copies the v2 candidate to
+`releases/XReelOs-v2.apk`, preserves `releases/XReelOs.apk` as the v1 rollback,
+and regenerates `releases/SHA256SUMS.txt` with both hashes.
 
 Equivalent Unity invocation:
 
@@ -82,8 +83,9 @@ as a Windows player first produces misleading missing-field errors.
 Output:
 
 ```text
-unity/build/android/XReelOs.apk
+unity/build/android/XReelOs-v2.apk
 package: com.spendinfr.xreelos
+version: 2.0.0 (code 2)
 entry:   ai.nreal.activitylife.NRXRActivity
 ```
 
@@ -108,7 +110,7 @@ entry:   ai.nreal.activitylife.NRXRActivity
 ## Release verification
 
 ```powershell
-$apk = ".\unity\build\android\XReelOs.apk"
+$apk = ".\unity\build\android\XReelOs-v2.apk"
 $analyzer = "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\apkanalyzer.bat"
 & $analyzer manifest application-id $apk
 & $analyzer files list $apk | Select-String "hand_landmarker|onnx|sherpa|webrtc|XrWebVr"
@@ -118,7 +120,7 @@ Get-FileHash $apk -Algorithm SHA256
 Expected: package `com.spendinfr.xreelos`, hand model present, and no MLOmega
 ONNX/Sherpa/WebRTC/live-transport libraries.
 
-The checked-in release is verified by `releases/SHA256SUMS.txt`.
+Both checked-in release artifacts are verified by `releases/SHA256SUMS.txt`.
 
 ## Hardware gate before release
 

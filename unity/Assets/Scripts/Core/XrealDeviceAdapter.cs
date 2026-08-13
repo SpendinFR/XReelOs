@@ -33,7 +33,10 @@ namespace MLOmega.XR.Core
     /// defined (no tarball installed yet) it reports <see cref="DeviceConnectionState.Disconnected"/>
     /// and yields no frames, so the rest of the app still loads.
     /// </summary>
-    public sealed class XrealDeviceAdapter : IXRDeviceAdapter, IDisposable
+    public sealed class XrealDeviceAdapter :
+        IXRDeviceAdapter,
+        INativeEyeFramePolicy,
+        IDisposable
     {
         private const string YuvShaderName = "Hidden/MLOmega/YUV420ToRGB";
 
@@ -59,6 +62,7 @@ namespace MLOmega.XR.Core
         public bool IsEyeActive => _eyeActive;
         public bool IsStereo => true;
         public string FrameSource => ContractDefaults.FrameSource.XrealEye;
+        public bool ConvertNativeEyeFramesToRgb { get; set; } = true;
 
         public event Action<DeviceConnectionState> ConnectionStateChanged;
 
@@ -266,14 +270,19 @@ namespace MLOmega.XR.Core
                     return null;
                 }
 
-                int w = planes[0].width;
-                int h = planes[0].height;
-                EnsureTarget(w, h);
+                Texture publishedTexture = planes[0];
+                if (ConvertNativeEyeFramesToRgb)
+                {
+                    int w = planes[0].width;
+                    int h = planes[0].height;
+                    EnsureTarget(w, h);
 
-                _yuvMaterial.SetTexture("_YTex", planes[0]);
-                _yuvMaterial.SetTexture("_UTex", planes[1]);
-                _yuvMaterial.SetTexture("_VTex", planes[2]);
-                Graphics.Blit(null, _rgbTarget, _yuvMaterial);
+                    _yuvMaterial.SetTexture("_YTex", planes[0]);
+                    _yuvMaterial.SetTexture("_UTex", planes[1]);
+                    _yuvMaterial.SetTexture("_VTex", planes[2]);
+                    Graphics.Blit(null, _rgbTarget, _yuvMaterial);
+                    publishedTexture = _rgbTarget;
+                }
 
                 // GetTimeStamp() is in the SDK's native units (monotonic); used for
                 // frame ordering / relative timing, not as a wall-clock value.
@@ -286,7 +295,7 @@ namespace MLOmega.XR.Core
 
                 _frameId++;
                 return new EyeFrame(
-                    _rgbTarget, _frameId, monotonicNs,
+                    publishedTexture, _frameId, monotonicNs,
                     planes[0], planes[1], planes[2]);
             }
             catch (Exception ex)

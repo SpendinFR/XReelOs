@@ -190,14 +190,21 @@ namespace MLOmega.XR.Reflex
             // XREAL Eye already exposes CPU-readable Y/U/V planes. Feeding those
             // directly avoids the synchronous GPU ReadPixels fence that used to
             // interrupt the 60 Hz XR render loop up to 25 times per second.
-            if (_useDedicatedEyePinchPipeline &&
-                _capture != null &&
-                _capture.TryGetCurrentNativeI420(
-                    out Texture2D planeY,
-                    out Texture2D planeU,
-                    out Texture2D planeV) &&
-                TryPushNativeI420(planeY, planeU, planeV, tsMs))
-                return;
+            if (_useDedicatedEyePinchPipeline && _capture != null)
+            {
+                if (_capture.TryGetCurrentNativeI420(
+                        out Texture2D planeY,
+                        out Texture2D planeU,
+                        out Texture2D planeV) &&
+                    TryPushNativeI420(planeY, planeU, planeV, tsMs))
+                    return;
+
+                // XReelOS v2 normally publishes native planes without an extra
+                // full-size RGB blit. If that fast path ever fails on a different
+                // Eye/runtime combination, restore the exact v1 RGB fallback from
+                // the next frame rather than sacrificing gesture functionality.
+                _capture.RequireRgbFrameFallback();
+            }
             PushDownscaledFrame(texture, tsMs);
 #endif
         }

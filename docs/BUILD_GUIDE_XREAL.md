@@ -35,7 +35,8 @@ product: XReel OS
 package: com.spendinfr.xreelos
 entry:   ai.nreal.activitylife.NRXRActivity
 scene:   Assets/Scenes/XReelOs.unity
-output:  releases/XReelOs.apk
+stable:  releases/XReelOs.apk
+v2 test: releases/XReelOs-v2.apk
 ```
 
 `BuildCommunityOsScene` sets `_osOnlyMode = true`. Creator/map tools, private
@@ -136,8 +137,9 @@ produce misleading missing-field errors.
 On success the script updates:
 
 ```text
-unity/build/android/XReelOs.apk
-releases/XReelOs.apk
+unity/build/android/XReelOs-v2.apk
+releases/XReelOs-v2.apk
+releases/XReelOs.apk (preserved v1 rollback)
 releases/SHA256SUMS.txt
 ```
 
@@ -411,6 +413,19 @@ Keep:
 - 25 fps gesture target unless measured otherwise;
 - 60 Hz as the validated XR baseline.
 
+The v2 thermal candidate additionally waits for a valid Media3 frame and then:
+
+- explicitly pauses HTML video/audio in the source page;
+- pauses/hides the source WebView and TLab capture host, removing the site preview
+  from the top of the phone while leaving return controls available;
+- keeps only Media3 decoding the immersive stream;
+- feeds MediaPipe from native Eye Y/U/V planes without a redundant full-size RGB
+  blit, with an automatic RGB fallback after any native submission failure.
+
+The raw-WebView VR fallback is not suspended because it is the fallback's source.
+These changes prove less duplicated work, not a measured thermal result. Keep v1
+available until a 20-30 minute hardware comparison passes.
+
 Selecting 90/120 Hz in ControlGlasses does not automatically make the Unity XR
 player render at that rate. Higher refresh increases thermal/GPU pressure and
 requires a complete frame-pacing, camera and gesture regression pass.
@@ -421,7 +436,7 @@ Install and confirm identity:
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-& $adb install -r ".\releases\XReelOs.apk"
+& $adb install -r ".\releases\XReelOs-v2.apk"
 & $adb shell dumpsys package com.spendinfr.xreelos |
   Select-String "versionName|versionCode"
 ```
@@ -440,7 +455,7 @@ Clean launch log:
 APK verification:
 
 ```powershell
-$apk = ".\releases\XReelOs.apk"
+$apk = ".\releases\XReelOs-v2.apk"
 $analyzer = "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\apkanalyzer.bat"
 & $analyzer manifest application-id $apk
 & $analyzer files list $apk |

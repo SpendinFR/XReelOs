@@ -70,5 +70,32 @@ namespace MLOmega.XR.UI
 
         public const string RestoreRawVideo =
             "try{if(window.__xreelVrRestore)window.__xreelVrRestore();}catch(err){}";
+
+        // Media3 owns the authenticated stream after the first decoded frame.
+        // WebView.onPause() alone is deliberately insufficient here: Android
+        // documents it as a best-effort renderer pause and it does not stop the
+        // page's JavaScript/media pipeline. Remember only media that was playing,
+        // then pause it explicitly. The page is normally recreated on immersive
+        // exit; ResumeSourceMedia is retained for a failed/aborted handoff.
+        public const string SuspendSourceMedia =
+            "try{(function(){var playing=[];var seen=[];" +
+            "function add(m){if(m&&seen.indexOf(m)<0){seen.push(m);" +
+            "if(!m.paused&&!m.ended){playing.push(m);try{m.pause();}catch(e){}}}}" +
+            "function scan(root){if(!root||!root.querySelectorAll)return;" +
+            "var media=root.querySelectorAll('video,audio');" +
+            "for(var i=0;i<media.length;i++)add(media[i]);" +
+            "var nodes=root.querySelectorAll('*');for(var j=0;j<nodes.length;j++){" +
+            "if(nodes[j].shadowRoot)scan(nodes[j].shadowRoot);}}" +
+            "scan(document);window.__xreelThermalPlaying=playing;" +
+            "window.__xreelThermalSuspended=true;return playing.length;})()}" +
+            "catch(err){0}";
+
+        public const string ResumeSourceMedia =
+            "try{(function(){var playing=window.__xreelThermalPlaying||[];" +
+            "window.__xreelThermalPlaying=null;window.__xreelThermalSuspended=false;" +
+            "for(var i=0;i<playing.length;i++){var m=playing[i];" +
+            "if(!m||!m.isConnected)continue;try{var p=m.play();" +
+            "if(p&&p.catch)p.catch(function(){});}catch(e){}}" +
+            "return playing.length;})()}catch(err){0}";
     }
 }

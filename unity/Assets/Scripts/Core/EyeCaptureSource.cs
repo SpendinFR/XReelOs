@@ -29,6 +29,12 @@ namespace MLOmega.XR.Core
         [SerializeField] private SessionPairing _pairing;
         [SerializeField] private PosePublisher _pose;
 
+        [Tooltip("Publish the XREAL Eye native Y/U/V planes without first creating " +
+                 "a redundant full-resolution RGB RenderTexture. Intended for the " +
+                 "OS gesture-only scene; automatically falls back to RGB if the " +
+                 "native MediaPipe path cannot consume a frame.")]
+        [SerializeField] private bool _preferNativeI420WithoutRgb;
+
         [Tooltip("Target capture rate (fps). 0 = publish every adapter update. " +
                  "Overridden by MLOmegaConfig.CaptureFps when a config is present.")]
         [Min(0f)]
@@ -105,6 +111,7 @@ namespace MLOmega.XR.Core
         private float _period;
         private float _accum;
         private long _nextFrameNumber;
+        private bool _rgbFallbackRequired;
 
         // Reused hot-path objects (allocation-free steady state).
         private readonly FrameEnvelope _envelope = new FrameEnvelope();
@@ -127,6 +134,8 @@ namespace MLOmega.XR.Core
 
         private void OnEnable()
         {
+            _rgbFallbackRequired = false;
+            ApplyNativeFramePolicy();
             _clock = _pairing != null && _pairing.MonotonicClock != null
                 ? _pairing.MonotonicClock
                 : new StopwatchMonotonicClock();
@@ -142,12 +151,48 @@ namespace MLOmega.XR.Core
             PublishedFrameCount = 0;
         }
 
+        private void OnDisable()
+        {
+            // Leave the shared adapter in its conservative RGB-compatible state
+            // if this OS-only publisher is ever disabled while the session lives.
+            if (_session?.Adapter is INativeEyeFramePolicy policy)
+                policy.ConvertNativeEyeFramesToRgb = true;
+        }
+
+        private void ApplyNativeFramePolicy()
+        {
+            if (_session?.Adapter is INativeEyeFramePolicy policy)
+            {
+                bool convertToRgb =
+                    !_preferNativeI420WithoutRgb || _rgbFallbackRequired;
+                if (policy.ConvertNativeEyeFramesToRgb != convertToRgb)
+                    policy.ConvertNativeEyeFramesToRgb = convertToRgb;
+            }
+        }
+
+        /// <summary>
+        /// Permanently restores RGB conversion for this session after one native
+        /// I420 submission failure. The current luminance frame remains a safe
+        /// one-frame fallback; subsequent frames use the original v1 RGB path.
+        /// </summary>
+        public void RequireRgbFrameFallback()
+        {
+            if (_rgbFallbackRequired) return;
+            _rgbFallbackRequired = true;
+            ApplyNativeFramePolicy();
+            Debug.LogWarning(
+                "[EyeCaptureSource] native I420 unavailable; RGB conversion restored.");
+        }
+
         private void Update()
         {
             if (_session == null || _session.Adapter == null)
             {
                 return;
             }
+            // XrSessionController constructs its adapter during Awake. Reapply
+            // here as a no-op guard against unusual component enable ordering.
+            ApplyNativeFramePolicy();
 
             // Cadence gate. period == 0 means "as fast as the adapter produces".
             _accum += Time.unscaledDeltaTime;
