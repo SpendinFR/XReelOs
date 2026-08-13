@@ -83,6 +83,10 @@ phone mirroring instead of stereo XR.
    Netflix or Prime cinema, Moonlight, and finally the internal VR browser with
    a direct non-DRM VR stream.
 
+During XReel operation, use the application's own recenter and return controls.
+On the validated One Pro setup, the glasses' physical X/2D-3D mode control can
+move the panel out of the display mode expected by the active XR session.
+
 ## Installed applications
 
 The current dock recognizes these Android package names:
@@ -125,3 +129,8 @@ PC; only the remote desktop surface depends on Sunshine and network reachability
 3. Keep DeX disabled.
 4. Launch XReel OS. If app windows are black, first verify Shizuku authorization
    rather than rebuilding Unity.
+
+Next, read the [User guide](USER_GUIDE.md) for context-sensitive gestures,
+cinema/Moonlight return and session recovery. Review
+[Known limitations and roadmap](KNOWN_LIMITATIONS.md) before changing firmware,
+refresh rate, phone or headset.

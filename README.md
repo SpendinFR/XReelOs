@@ -2,8 +2,9 @@
 
 XReel OS is an experimental spatial shell for **XREAL One Pro + XREAL Eye**.
 It turns Android apps, browser surfaces, protected cinema playback and a remote
-PC into movable world-space windows controlled by gaze and monocular
-Eye-camera hand gestures.
+PC into movable world-space windows controlled by a head-gaze pointer and
+monocular Eye-camera hand gestures. The Eye is an outward-facing camera; this
+release does not claim optical eye tracking.
 
 This repository contains the Unity source, Android bridge code, the complete
 Eye/MediaPipe interaction implementation, build scripts, troubleshooting notes
@@ -40,10 +41,10 @@ page](https://developer.xreal.com/download/).
   fist standby, and index scroll;
 - three low-light hand profiles and a head-only dwell click/drag fallback;
 - visionOS-style window chrome: move, depth, tilt, proportional/free resize,
-  portrait/landscape/aspect controls, close and persistent placement;
+  portrait/landscape/aspect controls, close and saved per-window placement;
 - reorganizable 3-4-3 app dock, quick system menu and multi-row window blocks;
 - Android app surfaces for Chrome/Google, YouTube, Reddit and Spotify;
-- an internal spatial browser with XR keyboard, gaze/pinch text input, page
+- an internal spatial browser with XR keyboard, head-gaze/pinch text input, page
   zoom and scrolling;
 - immersive browser video: direct media-stream capture, mono/SBS selection,
   VR180/VR360 projection, head-tracked viewing and in-VR seek/playback controls;
@@ -102,17 +103,38 @@ and outdoor use, read [Installation and first run](docs/INSTALLATION.md).
 
 ## Interaction quick reference
 
-| Gesture | Result |
-| --- | --- |
-| Look + pinch thumb/index | Click; hold to drag |
-| Open palm | Recenter the active window, or restore the last closed window |
-| Two open palms | Open and center the spatial dock |
-| Thumb up | Open the compact quick menu |
-| Closed fist | Put interaction/windows in standby; repeat to restore |
-| Pointing index moved vertically | Scroll the active surface |
+| Gesture | Normal spatial shell | Immersive VR |
+| --- | --- | --- |
+| Look + pinch thumb/index | Click; hold to drag | Use the visible VR controls |
+| Open palm | Recenter the active window, or restore the last closed window | No global exit action |
+| Two open palms | Open and center the spatial dock | Exit VR and restore the browser |
+| Thumb up | Open the compact quick menu | No global action |
+| Closed fist | Put interaction/windows in standby; repeat to restore | No global action |
+| Pointing index moved vertically | Scroll the active surface | Use the seek bar for video position |
 
 Window handles appear only when gazed at. Their exact behavior and the
 head-only mode are documented in [Interaction reference](docs/INTERACTION.md).
+The complete context-sensitive controls, 2D cinema return path, session resume
+and recovery shortcuts are in the [User guide](docs/USER_GUIDE.md).
+
+## Before you panic
+
+- Stuck in immersive VR: show **two open palms**.
+- Stuck in Netflix, Prime Video or Moonlight full-screen 2D: lower your gaze to
+  reveal the cinema/desktop dock, then select **Return to XReel**.
+- No windows are visible: show two palms for the dock, or one palm to restore
+  the last closed window.
+- Android application windows are black after a phone reboot: start Shizuku
+  again and confirm that XReel OS is authorized.
+- A Samsung taskbar, phone mirror or duplicated image means DeX owns the
+  external display. Stop there, disable DeX and run the preflight again.
+- Avoid the glasses' physical X/2D-3D mode button while XReel OS owns the XR
+  session. On the validated setup it can move the display out of the runtime
+  mode expected by the application; use XReel's own recenter/return controls.
+
+Read [Troubleshooting](docs/TROUBLESHOOTING.md) for recovery steps and
+[Known limitations and roadmap](docs/KNOWN_LIMITATIONS.md) before testing new
+phones, firmware, refresh rates or video sites.
 
 ## Build
 
