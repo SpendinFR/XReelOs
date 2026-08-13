@@ -40,6 +40,7 @@ namespace MLOmega.XR.Editor
         private const string ScenePath = PhoneOnlySceneBuilder.XrealScenePath;
         private const string ManifestPath = "Packages/manifest.json";
         private const string TarballRel = "Packages/xreal-sdk/com.xreal.xr.tar.gz";
+        private const string XReelIconPath = "Assets/Brand/XReelOsIcon.png";
         private const string XrealDep = "\"com.xreal.xr\": \"file:xreal-sdk/com.xreal.xr.tar.gz\"";
         private const string ArFoundationDep =
             "\"com.unity.xr.arfoundation\": \"6.0.6\"";
@@ -372,6 +373,7 @@ namespace MLOmega.XR.Editor
                     PlayerSettings.SetApplicationIdentifier(
                         BuildTargetGroup.Android,
                         "com.spendinfr.xreelos");
+                    ConfigureXReelOsIcon();
                     ConfigureXrealSdkSettings();
                     EnableXrealLoader();
                     ValidateArFoundationLoaded();
@@ -386,6 +388,14 @@ namespace MLOmega.XR.Editor
                     string outPath = Path.GetFullPath(Path.Combine(
                         "build", "android", "XReelOs.apk"));
                     Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+                    // Unity's incremental Android writer can preserve a stale
+                    // signing/padding tail when replacing an existing APK. The
+                    // ZIP payload remains valid but the physical file becomes
+                    // hundreds of MiB larger. A release artifact must start
+                    // from a fresh file.
+                    if (File.Exists(outPath)) File.Delete(outPath);
+                    string idsig = outPath + ".idsig";
+                    if (File.Exists(idsig)) File.Delete(idsig);
                     BuildReport report = BuildPipeline.BuildPlayer(
                         new BuildPlayerOptions
                         {
@@ -416,6 +426,35 @@ namespace MLOmega.XR.Editor
                     importer.SaveAndReimport();
                 }
             }
+        }
+
+        private static void ConfigureXReelOsIcon()
+        {
+            AssetDatabase.ImportAsset(
+                XReelIconPath,
+                ImportAssetOptions.ForceSynchronousImport);
+            var importer = AssetImporter.GetAtPath(XReelIconPath) as TextureImporter;
+            if (importer == null)
+                throw new FileNotFoundException(
+                    "XReel OS launcher icon is missing.", XReelIconPath);
+            importer.textureType = TextureImporterType.Default;
+            importer.alphaSource = TextureImporterAlphaSource.None;
+            importer.mipmapEnabled = false;
+            importer.sRGBTexture = true;
+            importer.maxTextureSize = 1024;
+            importer.textureCompression = TextureImporterCompression.Uncompressed;
+            importer.npotScale = TextureImporterNPOTScale.ToNearest;
+            importer.SaveAndReimport();
+
+            Texture2D icon = AssetDatabase.LoadAssetAtPath<Texture2D>(
+                XReelIconPath);
+            if (icon == null)
+                throw new Exception("XReel OS launcher icon import failed.");
+#pragma warning disable 618
+            PlayerSettings.SetIconsForTargetGroup(
+                BuildTargetGroup.Android,
+                new[] { icon });
+#pragma warning restore 618
         }
 
         private static void EmbedHandTrackingModelOnly()
@@ -737,7 +776,11 @@ namespace MLOmega.XR.Editor
         private static void EnsureS24DisplayCompatibility()
         {
             string script = Path.GetFullPath(Path.Combine(
-                "..", "..", "scripts", "PATCH_XREAL_S24_DISPLAY.ps1"));
+                Application.dataPath,
+                "..",
+                "..",
+                "scripts",
+                "PATCH_XREAL_S24_DISPLAY.ps1"));
             if (!File.Exists(script))
                 throw new Exception(
                     "[AndroidBuildXreal] S24 display compatibility script missing: " +
@@ -1167,25 +1210,53 @@ namespace MLOmega.XR.Editor
         private static void ConfigureExternalTools()
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string sdk = Env("MLOMEGA_ANDROID_SDK", Path.Combine(localAppData, "Android", "Sdk"));
-            string ndk = Env("MLOMEGA_ANDROID_NDK", Path.Combine(sdk, "ndk", NdkVersion));
-            string jdk = Env("MLOMEGA_ANDROID_JDK", @"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot");
-            string gradle = Env("MLOMEGA_GRADLE_HOME", Path.GetFullPath(Path.Combine("..", "..", ".tools", "gradle-8.7")));
+            string editorDirectory = Path.GetDirectoryName(
+                EditorApplication.applicationPath);
+            string androidPlayer = Path.Combine(
+                editorDirectory,
+                "Data",
+                "PlaybackEngines",
+                "AndroidPlayer");
+            string installedSdk = Path.Combine(localAppData, "Android", "Sdk");
+            string embeddedSdk = Path.Combine(androidPlayer, "SDK");
+            string sdk = Env(
+                "MLOMEGA_ANDROID_SDK",
+                Directory.Exists(installedSdk) ? installedSdk : embeddedSdk);
+            string installedNdk = Path.Combine(sdk, "ndk", NdkVersion);
+            string embeddedNdk = Path.Combine(androidPlayer, "NDK");
+            string ndk = Env(
+                "MLOMEGA_ANDROID_NDK",
+                Directory.Exists(installedNdk) ? installedNdk : embeddedNdk);
+            const string installedJdk =
+                @"C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot";
+            string embeddedJdk = Path.Combine(androidPlayer, "OpenJDK");
+            string jdk = Env(
+                "MLOMEGA_ANDROID_JDK",
+                Directory.Exists(installedJdk) ? installedJdk : embeddedJdk);
+            string gradle = Environment.GetEnvironmentVariable(
+                "MLOMEGA_GRADLE_HOME") ?? string.Empty;
+            bool useEmbeddedGradle =
+                string.IsNullOrWhiteSpace(gradle) || !Directory.Exists(gradle);
             EditorPrefs.SetBool("SdkUseEmbedded", false);
             EditorPrefs.SetBool("NdkUseEmbedded", false);
             EditorPrefs.SetBool("JdkUseEmbedded", false);
+            EditorPrefs.SetBool("GradleUseEmbedded", useEmbeddedGradle);
             EditorPrefs.SetString("AndroidSdkRoot", sdk);
             EditorPrefs.SetString("AndroidNdkRootR23", ndk);
             EditorPrefs.SetString("AndroidNdkRoot", ndk);
             EditorPrefs.SetString("JdkPath", jdk);
-            if (Directory.Exists(gradle)) { EditorPrefs.SetBool("GradleUseEmbedded", false); EditorPrefs.SetString("GradlePath", gradle); }
+            if (!useEmbeddedGradle)
+                EditorPrefs.SetString("GradlePath", gradle);
 #if UNITY_2022_2_OR_NEWER
             AndroidExternalToolsSettings.sdkRootPath = sdk;
             AndroidExternalToolsSettings.ndkRootPath = ndk;
             AndroidExternalToolsSettings.jdkRootPath = jdk;
-            if (Directory.Exists(gradle)) AndroidExternalToolsSettings.gradlePath = gradle;
+            if (!useEmbeddedGradle)
+                AndroidExternalToolsSettings.gradlePath = gradle;
 #endif
-            Debug.Log($"[AndroidBuildXreal] SDK={sdk} NDK={ndk} JDK={jdk} Gradle={gradle}");
+            Debug.Log(
+                $"[AndroidBuildXreal] SDK={sdk} NDK={ndk} JDK={jdk} " +
+                $"Gradle={(useEmbeddedGradle ? "Unity embedded" : gradle)}");
         }
 
         private static void ConfigurePlayerSettings()
@@ -1698,9 +1769,14 @@ namespace MLOmega.XR.Editor
                 InjectSecureSurfaceWidevineProbe(path);
                 return;
             }
-            if (!identifier.StartsWith(
-                    "com.mlomega.xr.worldatelierlab",
-                    StringComparison.Ordinal))
+            bool isIsolatedLab = identifier.StartsWith(
+                "com.mlomega.xr.worldatelierlab",
+                StringComparison.Ordinal);
+            bool isXReelOs = string.Equals(
+                identifier,
+                "com.spendinfr.xreelos",
+                StringComparison.Ordinal);
+            if (!isIsolatedLab && !isXReelOs)
                 return;
 
             string manifest = Path.Combine(path, "src", "main", "AndroidManifest.xml");
@@ -1751,6 +1827,24 @@ namespace MLOmega.XR.Editor
 
         private static void InjectSecureSurfaceWidevineProbe(string unityLibraryPath)
         {
+            string applicationIdentifier =
+                PlayerSettings.GetApplicationIdentifier(BuildTargetGroup.Android);
+            // Every isolated Lab version uses the same WebVR/Media3 bridge.
+            // Restricting injection to the historical v15 package left v14
+            // builds compiling against a stale Java file in Library/Bee: Unity
+            // rendered VR, but new playback controls failed at runtime with
+            // NoSuchMethod/AndroidJavaException.
+            bool isolatedWebVr = applicationIdentifier.StartsWith(
+                "com.mlomega.xr.worldatelierlabv",
+                StringComparison.Ordinal) ||
+                string.Equals(
+                    applicationIdentifier,
+                    "com.mlomega.xr.worldatelierlab",
+                    StringComparison.Ordinal) ||
+                string.Equals(
+                    applicationIdentifier,
+                    "com.spendinfr.xreelos",
+                    StringComparison.Ordinal);
             string template = Path.Combine(
                 Application.dataPath,
                 "Scripts",
@@ -1773,6 +1867,33 @@ namespace MLOmega.XR.Editor
                 "SecureWidevinePlayer.java");
             Directory.CreateDirectory(Path.GetDirectoryName(java));
             File.Copy(template, java, true);
+
+            string webVrJava = null;
+            if (isolatedWebVr)
+            {
+                string webVrTemplate = Path.Combine(
+                    Application.dataPath,
+                    "Scripts",
+                    "Editor",
+                    "XrWebVr",
+                    "XrWebVrBridge.java.txt");
+                if (!File.Exists(webVrTemplate))
+                    throw new FileNotFoundException(
+                        "Isolated Web VR Java bridge template missing.",
+                        webVrTemplate);
+                webVrJava = Path.Combine(
+                    unityLibraryPath,
+                    "src",
+                    "main",
+                    "java",
+                    "com",
+                    "mlomega",
+                    "xr",
+                    "webvr",
+                    "XrWebVrBridge.java");
+                Directory.CreateDirectory(Path.GetDirectoryName(webVrJava));
+                File.Copy(webVrTemplate, webVrJava, true);
+            }
 
             string trustedServiceTemplate = Path.Combine(
                 Application.dataPath,
@@ -1857,7 +1978,6 @@ namespace MLOmega.XR.Editor
                 Application.dataPath,
                 "..",
                 "..",
-                "..",
                 "scripts",
                 "xreal-compat",
                 "native",
@@ -1880,7 +2000,6 @@ namespace MLOmega.XR.Editor
 
             string taskOrganizerStubs = Path.GetFullPath(Path.Combine(
                 Application.dataPath,
-                "..",
                 "..",
                 "..",
                 "scripts",
@@ -2001,7 +2120,7 @@ namespace MLOmega.XR.Editor
                         "Generated unityLibrary build.gradle has no dependencies block: " +
                         gradle);
                 dependencies += "dependencies {".Length;
-                const string media3 =
+                string media3 =
                     "\n    // MLOMEGA_SECURE_SURFACE_MEDIA3\n" +
                     "    compileOnly files('compile-stubs/taskorganizer-stubs.jar')\n" +
                     isolatedShizuku +
@@ -2020,7 +2139,17 @@ namespace MLOmega.XR.Editor
                     "        exclude group: 'androidx.exifinterface'\n" +
                     "        exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib'\n" +
                     "        exclude group: 'org.jetbrains', module: 'annotations'\n" +
-                    "    }\n";
+                    "    }\n" +
+                    (isolatedWebVr
+                        ? "    implementation('androidx.media3:media3-exoplayer-hls:1.5.1') {\n" +
+                          "        exclude group: 'androidx.core'\n" +
+                          "        exclude group: 'androidx.annotation'\n" +
+                          "        exclude group: 'androidx.collection'\n" +
+                          "        exclude group: 'androidx.exifinterface'\n" +
+                          "        exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib'\n" +
+                          "        exclude group: 'org.jetbrains', module: 'annotations'\n" +
+                          "    }\n"
+                        : string.Empty);
                 text = text.Insert(dependencies, media3);
                 const string allJars =
                     "implementation fileTree(dir: 'libs', include: ['*.jar'])";
@@ -2041,7 +2170,8 @@ namespace MLOmega.XR.Editor
                 "[AndroidBuildXreal] Isolated Media3/Shizuku display probe injected: " +
                 java + " + " + trustedServiceJava + " + " + taskProbeJava +
                 " + " + physicalStereoProbeJava + " + " + nativeProbeDestination +
-                " + " + compileStubs);
+                " + " + compileStubs +
+                (webVrJava != null ? " + " + webVrJava : string.Empty));
         }
     }
 }

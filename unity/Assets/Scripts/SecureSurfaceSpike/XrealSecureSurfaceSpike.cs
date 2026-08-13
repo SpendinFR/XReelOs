@@ -136,6 +136,9 @@ namespace MLOmega.XR.SecureSurfaceSpike
         private int _alternateLayerId = LegacyLayerId + 1;
         private int _initialSlot;
         private bool _surfaceTransitionActive;
+        private bool _nativeLayerFrontFacing = true;
+        private GameObject _backFaceGlass;
+        private RectTransform _backFaceRect;
 
         public event Action<XrealSecureSurfaceSpike> Closed;
         public event Action<XrealSecureSurfaceSpike> Focused;
@@ -323,7 +326,30 @@ namespace MLOmega.XR.SecureSurfaceSpike
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (_useMultiSession) return;
+            if (string.Equals(
+                    _startupPackageName,
+                    "com.limelight",
+                    StringComparison.Ordinal))
+            {
+                StartCoroutine(CloseMoonlightAfterCinemaReturn());
+                return;
+            }
             StartCoroutine(ReattachProtectedVideoLayer());
+#endif
+        }
+
+        private IEnumerator CloseMoonlightAfterCinemaReturn()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            // Moonlight's Android Surface is invalid after the system 2D panel
+            // gives display ownership back to XREAL. Recreating it produces a
+            // persistent black window. Close that one host cleanly instead.
+            yield return new WaitForSecondsRealtime(.40f);
+            _creator?.RestoreCinemaTransitionLayout();
+            CloseSpatialVideoWindow();
+            CinemaReturnCompleted?.Invoke();
+#else
+            yield break;
 #endif
         }
 
@@ -447,10 +473,11 @@ namespace MLOmega.XR.SecureSurfaceSpike
         private void SubmitProtectedLayer()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
+            RefreshNativeLayerFacing();
             // XREAL clears OverlayBase::active while preparing every XR frame.
             // Submit immediately before rendering so the layer cannot be cleared
             // by an asynchronous 60 Hz XR frame between ordinary Update calls.
-            if (_layerCreated && _windowVisible &&
+            if (_layerCreated && _windowVisible && _nativeLayerFrontFacing &&
                 _windowRect != null && _windowRect.gameObject.activeInHierarchy)
             {
                 // Preserve the validated world lock while the navigation window
@@ -461,6 +488,26 @@ namespace MLOmega.XR.SecureSurfaceSpike
                 SetActiveCompositionLayer(_layerId);
             }
 #endif
+        }
+
+        private void RefreshNativeLayerFacing()
+        {
+            if (_xrCamera == null || _windowRect == null) return;
+            float facing = Vector3.Dot(
+                _windowRect.forward,
+                _xrCamera.transform.position - _windowRect.position);
+            bool previous = _nativeLayerFrontFacing;
+            // Hysteresis prevents compositor flicker at the side edge. The
+            // Android stream is not duplicated, keeping this thermally free.
+            if (_nativeLayerFrontFacing && facing > .06f)
+                _nativeLayerFrontFacing = false;
+            else if (!_nativeLayerFrontFacing && facing < -.06f)
+                _nativeLayerFrontFacing = true;
+            if (_backFaceGlass != null)
+                _backFaceGlass.SetActive(!_nativeLayerFrontFacing);
+            if (previous != _nativeLayerFrontFacing)
+                Debug.Log(Tag + " native window face=" +
+                          (_nativeLayerFrontFacing ? "front" : "glass-back"));
         }
 
         private void UpdateLayerPoseFromWorldWindow()
@@ -536,6 +583,24 @@ namespace MLOmega.XR.SecureSurfaceSpike
             frame.rectTransform.anchorMax = Vector2.one;
             frame.rectTransform.offsetMin = Vector2.zero;
             frame.rectTransform.offsetMax = Vector2.zero;
+            Image backFace = MakeImage(
+                _windowRect,
+                "Android app mirror glass back",
+                Vector2.zero,
+                _windowRect.sizeDelta - new Vector2(28f, 28f),
+                new Color(.13f, .14f, .17f, .72f));
+            backFace.raycastTarget = false;
+            backFace.rectTransform.localRotation = Quaternion.Euler(0f, 180f, 0f);
+            _backFaceRect = backFace.rectTransform;
+            TextMeshProUGUI backLabel = MakeLabel(
+                backFace.rectTransform,
+                _startupLabel,
+                Vector2.zero,
+                new Vector2(760f, 52f),
+                22f);
+            backLabel.alignment = TextAlignmentOptions.Center;
+            _backFaceGlass = backFace.gameObject;
+            _backFaceGlass.SetActive(false);
             Image header = MakeImage(
                 _windowRect,
                 "Secure video header",
@@ -620,6 +685,10 @@ namespace MLOmega.XR.SecureSurfaceSpike
         {
             if (_windowRect == null || _videoRect == null) return;
             Vector2 size = _windowRect.rect.size;
+            if (_backFaceRect != null)
+                _backFaceRect.sizeDelta = new Vector2(
+                    Mathf.Max(120f, size.x - 28f),
+                    Mathf.Max(90f, size.y - 28f));
             _videoRect.anchorMin = _videoRect.anchorMax = new Vector2(0.5f, 0.5f);
             _videoRect.anchoredPosition = Vector2.zero;
             float availableWidth = Mathf.Max(560f, size.x - 72f);

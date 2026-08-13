@@ -179,6 +179,10 @@ namespace MLOmega.XR.UI
             ExtendDock();
             BuildDockReorderSystem();
             BuildKeyboard();
+            // The Lab is now the XReel OS shell, not the Atelier editor. Keep
+            // the legacy Pupitre fully closed so none of its hidden PRESET
+            // controls can overlap browser interaction.
+            _creator.RestoreLabWorkspaceForSession(false);
             _creator.RegisterLabSettingsActions(
                 SaveSessionAndQuit,
                 ToggleKeyboardFromSettings,
@@ -324,14 +328,13 @@ namespace MLOmega.XR.UI
             if (_osOnlyMode)
             {
                 MakeDockButton(
-                    "Files",
+                    "Navigateur VR",
                     new Vector2(150f, 150f),
-                    "com.sec.android.app.myfiles",
-                    "▣",
-                    () => OpenOrFocusProtectedApplication(
-                        "com.sec.android.app.myfiles",
-                        string.Empty,
-                        "Files"));
+                    "com.android.chrome",
+                    "VR",
+                    () => OpenBrowser(
+                        "Navigateur VR",
+                        "https://www.google.com/"));
             }
             MakeDockButton(
                 "Google",
@@ -531,9 +534,10 @@ namespace MLOmega.XR.UI
 
         private static readonly Vector2[] DockSlotPositions =
         {
-            new Vector2(-150f, 150f),
-            new Vector2(0f, 150f),
-            new Vector2(150f, 150f),
+            new Vector2(-225f, 150f),
+            new Vector2(-75f, 150f),
+            new Vector2(75f, 150f),
+            new Vector2(225f, 150f),
             new Vector2(-225f, 0f),
             new Vector2(-75f, 0f),
             new Vector2(75f, 0f),
@@ -613,11 +617,31 @@ namespace MLOmega.XR.UI
             if (!string.IsNullOrWhiteSpace(saved))
             {
                 string[] ids = saved.Split('|');
-                for (int slot = 0; slot < ids.Length; slot++)
+                var restoredIds = new HashSet<string>();
+                var occupiedSlots = new HashSet<int>();
+                for (
+                    int slot = 0;
+                    slot < ids.Length && slot < DockSlotPositions.Length;
+                    slot++)
                 {
                     DockReorderEntry entry = _dockEntries.Find(
                         candidate => candidate.Id == ids[slot]);
-                    if (entry != null) entry.Slot = slot;
+                    if (entry == null || !restoredIds.Add(entry.Id)) continue;
+                    entry.Slot = slot;
+                    occupiedSlots.Add(slot);
+                }
+                // New apps (for example Navigateur VR) were absent from older
+                // 3-4-3 preferences. Give each one a genuinely free slot rather
+                // than overlapping whichever legacy app already owns its index.
+                foreach (DockReorderEntry entry in _dockEntries)
+                {
+                    if (restoredIds.Contains(entry.Id)) continue;
+                    for (int slot = 0; slot < DockSlotPositions.Length; slot++)
+                    {
+                        if (!occupiedSlots.Add(slot)) continue;
+                        entry.Slot = slot;
+                        break;
+                    }
                 }
             }
             LayoutDockEntries();
@@ -948,6 +972,7 @@ namespace MLOmega.XR.UI
         {
             GestureBridge gestures = FindFirstObjectByType<GestureBridge>();
             gestures?.RestartAfterExternalCameraResume();
+            _creator?.OpenWindowDockIfNoVisibleWindows();
         }
 
         private void ReleaseAllProtectedApplications()
@@ -1137,8 +1162,8 @@ namespace MLOmega.XR.UI
             }
             if (state != null && state.keyboardVisible)
                 ShowKeyboard(KeyboardTarget.WebContent);
-            _creator?.RestoreLabWorkspaceForSession(
-                state != null && state.workspaceVisible);
+            // Never restore the legacy Atelier Pupitre in the browser/VR Lab.
+            _creator?.RestoreLabWorkspaceForSession(false);
         }
 
         private static string MigrateProtectedPackage(string packageName) =>
@@ -1180,6 +1205,7 @@ namespace MLOmega.XR.UI
             if (window == null) return;
             int index = _windows.IndexOf(window);
             if (index < 0) return;
+            window.PrepareClose();
             _windows.RemoveAt(index);
             if (_activeBrowser == window)
                 _activeBrowser = _windows.Count == 0
@@ -1220,19 +1246,23 @@ namespace MLOmega.XR.UI
                 21f,
                 Ink,
                 FontStyles.Normal);
-            string[] rows = { "1234567890", "AZERTYUIOP", "QSDFGHJKLM", "WXCVBN,.;:" };
-            float[] starts = { -405f, -405f, -405f, -360f };
+            // Stagger the AZERTY rows like a physical keyboard. W now sits
+            // exactly between Q and S; @ occupies the useful email shortcut to
+            // its left instead of keeping cramped duplicate punctuation.
+            string[] rows = { "1234567890", "AZERTYUIOP", "QSDFGHJKLM", "@WXCVBN,.-_" };
+            float[] starts = { -405f, -405f, -405f, -435f };
             float[] ys = { 130f, 55f, -20f, -95f };
             for (int row = 0; row < rows.Length; row++)
             {
                 for (int column = 0; column < rows[row].Length; column++)
                 {
                     char key = rows[row][column];
+                    float step = row == 3 ? 75f : 90f;
                     MakeButton(
                         _keyboardRect,
                         key.ToString(),
-                        new Vector2(starts[row] + column * 90f, ys[row]),
-                        new Vector2(76f, 62f),
+                        new Vector2(starts[row] + column * step, ys[row]),
+                        new Vector2(row == 3 ? 64f : 76f, 62f),
                         () => ReceiveCharacter(key));
                 }
             }
@@ -1599,6 +1629,11 @@ namespace MLOmega.XR.UI
         private int _scaleScheduledVersion = -1;
         private int _xrViewportWidth = 1080;
         private bool _eventPumpFailed;
+        private bool _vrObserverInstallRequested;
+        private float _nextVrObserverInstall;
+        private bool _shutdownRequested;
+        private bool _viewportSwipeRunning;
+        private float _nextFrameCopyAt;
 #if UNITY_ANDROID && !UNITY_EDITOR
         private AndroidJavaObject _nativeWebView;
 #endif
@@ -1634,6 +1669,7 @@ namespace MLOmega.XR.UI
             // loading texture even though Chromium has finished the page.
             if (state != State.Initialized) return;
             ConfigureNativeWebViewOnce();
+            EnsureVrObserverInstalled();
             PumpPageEvents();
             if (_warmInvalidationsRemaining > 0 &&
                 Time.unscaledTime >= _nextWarmInvalidation)
@@ -1642,7 +1678,17 @@ namespace MLOmega.XR.UI
                 _warmInvalidationsRemaining--;
                 RequestNativeRedraw();
             }
-            UpdateFrame();
+            // ByteBuffer capture performs a full CPU -> Texture2D upload. The
+            // WebView is intentionally configured at 15 fps, so copying the same
+            // 1080x608 buffer on every 60 Hz Unity frame wastes bandwidth and
+            // starves XREAL's compositor. Keep page/event handling responsive,
+            // but upload only at the requested browser cadence.
+            if (Time.unscaledTime >= _nextFrameCopyAt)
+            {
+                _nextFrameCopyAt = Time.unscaledTime +
+                    1f / Mathf.Max(2, _targetFps);
+                UpdateFrame();
+            }
         }
 
         public void RequestNativeRedraw()
@@ -1667,11 +1713,114 @@ namespace MLOmega.XR.UI
 #endif
         }
 
+        /// <summary>
+        /// Restarts the short redraw burst after Android removes a native
+        /// Presentation from the XREAL display. A single invalidation races the
+        /// Surface destruction on Android 16 and leaves the captured page grey.
+        /// </summary>
+        public void WakeAfterNativePresentation()
+        {
+            _warmInvalidationsRemaining = 12;
+            _nextWarmInvalidation = 0f;
+            RequestNativeRedraw();
+        }
+
+        private void EnsureVrObserverInstalled()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_vrObserverInstallRequested || _nativeWebView == null ||
+                Time.unscaledTime < _nextVrObserverInstall)
+                return;
+            _nextVrObserverInstall = Time.unscaledTime + 2f;
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                bridge.CallStatic("install", _nativeWebView);
+                _vrObserverInstallRequested = true;
+                Debug.Log("[XrLabVR] authenticated media observer requested.");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    "[XrLabVR] observer install failed: " +
+                    exception.GetType().Name + " / " + exception.Message);
+            }
+#endif
+        }
+
         public void SetXrViewportWidth(int pixelWidth)
         {
             _xrViewportWidth = Mathf.Clamp(pixelWidth, 640, 1920);
             if (state == State.Initialized) ApplyXrViewportConstraint();
         }
+
+        public void AdjustPageZoom(float factor)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_nativeWebView == null || factor <= 0f) return;
+            try
+            {
+                using var player = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+                using AndroidJavaObject activity =
+                    player.GetStatic<AndroidJavaObject>("currentActivity");
+                activity.Call("runOnUiThread", new AndroidJavaRunnable(() =>
+                {
+                    try
+                    {
+                        float before = _nativeWebView.Call<float>("getScale");
+                        _nativeWebView.Call("zoomBy", factor);
+                        _nativeWebView.Call("postInvalidateOnAnimation");
+                        float after = _nativeWebView.Call<float>("getScale");
+                        Debug.Log($"[XrLab] page zoom {before:F2} -> {after:F2}.");
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogWarning("[XrLab] page zoom failed: " + exception.Message);
+                    }
+                }));
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[XrLab] page zoom unavailable: " + exception.Message);
+            }
+#endif
+        }
+
+        public void ResetPageZoom()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_nativeWebView == null) return;
+            try
+            {
+                using var player = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+                using AndroidJavaObject activity =
+                    player.GetStatic<AndroidJavaObject>("currentActivity");
+                activity.Call("runOnUiThread", new AndroidJavaRunnable(() =>
+                {
+                    try
+                    {
+                        float current = _nativeWebView.Call<float>("getScale");
+                        if (current > .01f)
+                            _nativeWebView.Call("zoomBy", 1f / current);
+                        _nativeWebView.Call("postInvalidateOnAnimation");
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogWarning("[XrLab] page zoom reset failed: " + exception.Message);
+                    }
+                }));
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[XrLab] page zoom reset unavailable: " + exception.Message);
+            }
+#endif
+        }
+
+        public int TargetFps => _targetFps;
+
+        public int XrViewportWidth => _xrViewportWidth;
 
         private void ApplyXrViewportConstraint()
         {
@@ -1891,10 +2040,300 @@ namespace MLOmega.XR.UI
         public void SetTargetFps(int fps)
         {
             _targetFps = Mathf.Clamp(fps, 2, 30);
+            _nextFrameCopyAt = 0f;
             if (state == State.Initialized)
                 SetFps(_targetFps);
             else
                 m_fps = _targetFps;
+        }
+
+        public bool TryGetCapturedVrStream(out string descriptor)
+        {
+            descriptor = string.Empty;
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_nativeWebView == null) return false;
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                descriptor = bridge.CallStatic<string>(
+                    "getLastStreamJson", _nativeWebView) ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(descriptor);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    "[XrLabVR] authenticated stream bridge unavailable: " +
+                    exception.GetType().Name);
+            }
+#endif
+            return false;
+        }
+
+        public bool RejectCapturedVrStream()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_nativeWebView == null) return false;
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                return bridge.CallStatic<bool>(
+                    "rejectLastStream", _nativeWebView);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    "[XrLabVR] candidate rejection unavailable: " +
+                    exception.GetType().Name);
+            }
+#endif
+            return false;
+        }
+
+        public bool StartNativeVrStream(
+            string descriptor,
+            int angleDegrees,
+            string stereoMode)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (string.IsNullOrWhiteSpace(descriptor)) return false;
+            try
+            {
+                using var player = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+                using AndroidJavaObject activity =
+                    player.GetStatic<AndroidJavaObject>("currentActivity");
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                return bridge.CallStatic<bool>(
+                    "start", activity, descriptor, angleDegrees, stereoMode);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    "[XrLabVR] native player start failed: " +
+                    exception.GetType().Name);
+            }
+#endif
+            return false;
+        }
+
+        public void StopNativeVrStream()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                bridge.CallStatic("stop");
+            }
+            catch (Exception) { }
+#endif
+        }
+
+        public void SetVrSourcePagePaused(bool paused)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (_nativeWebView == null) return;
+            try
+            {
+                using var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+                using AndroidJavaObject activity =
+                    unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
+                AndroidJavaObject webView = _nativeWebView;
+                activity.Call("runOnUiThread", new AndroidJavaRunnable(() =>
+                {
+                    try
+                    {
+                        webView?.Call(paused ? "onPause" : "onResume");
+                        if (!paused)
+                            webView?.Call("postInvalidateOnAnimation");
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogWarning(
+                            "[XrLabVR] source page pause transition failed: " +
+                            exception.GetType().Name);
+                    }
+                }));
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    "[XrLabVR] source page pause unavailable: " +
+                    exception.GetType().Name);
+            }
+#endif
+        }
+
+        /// <summary>
+        /// Immediately removes TLab's Android render host from display 0 before
+        /// Unity destroys the spatial window. TLab's regular disposal remains
+        /// responsible for releasing Chromium and the capture texture; this
+        /// early hide prevents its last white frame from lingering on the S24.
+        /// Safe to call more than once.
+        /// </summary>
+        public void ShutdownNow()
+        {
+            if (_shutdownRequested) return;
+            _shutdownRequested = true;
+            StopNativeVrStream();
+
+            if (m_rawImage != null)
+            {
+                m_rawImage.enabled = false;
+                m_rawImage.texture = null;
+            }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            AndroidJavaObject webView = _nativeWebView;
+            AndroidJavaObject rootLayout = GetNativeField("mRootLayout");
+            AndroidJavaObject captureLayout = GetNativeField("mCaptureLayout");
+            AndroidJavaObject glSurface = GetNativeField("mGlSurfaceView");
+            _nativeWebView = null;
+            if (webView != null || rootLayout != null ||
+                captureLayout != null || glSurface != null)
+            {
+                try
+                {
+                    using var player = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
+                    using AndroidJavaObject activity =
+                        player.GetStatic<AndroidJavaObject>("currentActivity");
+                    activity.Call("runOnUiThread", new AndroidJavaRunnable(() =>
+                    {
+                        try
+                        {
+                            // TLab adds an opaque root layout and a dedicated
+                            // CustomGLSurfaceView directly to UnityPlayerActivity.
+                            // Hiding only android.webkit.WebView leaves that white
+                            // capture host alive. Remove the whole host immediately,
+                            // before TLab's asynchronous disposal reaches the UI.
+                            webView?.Call("setVisibility", 8); // View.GONE
+                            webView?.Call("stopLoading");
+                            webView?.Call("clearFocus");
+                            captureLayout?.Call("setVisibility", 8);
+                            if (glSurface != null)
+                            {
+                                glSurface.Call("setVisibility", 8);
+                                try { glSurface.Call("onPause"); }
+                                catch (Exception) { }
+                            }
+                            if (rootLayout != null)
+                            {
+                                rootLayout.Call("setVisibility", 8);
+                                using AndroidJavaObject parent =
+                                    rootLayout.Call<AndroidJavaObject>("getParent");
+                                parent?.Call("removeView", rootLayout);
+                            }
+                        }
+                        catch (Exception exception)
+                        {
+                            Debug.LogWarning(
+                                "[XrLab] immediate WebView hide failed: " +
+                                exception.GetType().Name);
+                        }
+                        finally
+                        {
+                            webView?.Dispose();
+                            rootLayout?.Dispose();
+                            captureLayout?.Dispose();
+                            glSurface?.Dispose();
+                        }
+                    }));
+                }
+                catch (Exception exception)
+                {
+                    webView?.Dispose();
+                    rootLayout?.Dispose();
+                    captureLayout?.Dispose();
+                    glSurface?.Dispose();
+                    Debug.LogWarning(
+                        "[XrLab] immediate WebView shutdown unavailable: " +
+                        exception.GetType().Name);
+                }
+            }
+#endif
+
+            // Preserve the plugin's supported teardown path. FragmentCapture's
+            // Destroy() is already state-guarded, so its later OnDestroy is safe.
+            base.Destroy();
+            Debug.Log("[XrLab] browser render host hidden and disposal requested.");
+        }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        private AndroidJavaObject GetNativeField(string fieldName)
+        {
+            if (m_NativePlugin == null) return null;
+            AndroidJavaObject type = null;
+            try
+            {
+                type = m_NativePlugin.Call<AndroidJavaObject>("getClass");
+                while (type != null)
+                {
+                    try
+                    {
+                        using AndroidJavaObject field =
+                            type.Call<AndroidJavaObject>("getDeclaredField", fieldName);
+                        field.Call("setAccessible", true);
+                        return field.Call<AndroidJavaObject>("get", m_NativePlugin);
+                    }
+                    catch (AndroidJavaException)
+                    {
+                        AndroidJavaObject parent =
+                            type.Call<AndroidJavaObject>("getSuperclass");
+                        type.Dispose();
+                        type = parent;
+                    }
+                }
+            }
+            catch (Exception) { }
+            finally
+            {
+                type?.Dispose();
+            }
+            return null;
+        }
+#endif
+
+        public bool IsNativeVrStreamActive()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                return bridge.CallStatic<bool>("isActive");
+            }
+            catch (Exception) { }
+#endif
+            return false;
+        }
+
+        public string NativeVrStatus()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                return bridge.CallStatic<string>("getStatus") ?? "unknown";
+            }
+            catch (Exception) { }
+#endif
+            return "unavailable";
+        }
+
+        public void SetNativeVrHeadPose(float yawDegrees, float pitchDegrees)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                using var bridge = new AndroidJavaClass(
+                    "com.mlomega.xr.webvr.XrWebVrBridge");
+                bridge.CallStatic("setHeadPose", yawDegrees, pitchDegrees);
+            }
+            catch (Exception) { }
+#endif
         }
 
         public void ScrollAt(Vector2Int webPoint, int deltaY)
@@ -1904,17 +2343,68 @@ namespace MLOmega.XR.UI
                 .ToString("R", CultureInfo.InvariantCulture);
             string y = Mathf.Clamp01(webPoint.y / (float)viewSize.y)
                 .ToString("R", CultureInfo.InvariantCulture);
-            // WebView.ScrollBy always scrolls the document. Consent dialogs and
-            // other web popups instead own a nested scroll container; select the
-            // nearest scrollable ancestor under the XR gaze, then fall back to
-            // the page. This preserves normal pages and makes modal content usable.
+            // WebView.ScrollBy only scrolls the document. Consent dialogs and
+            // modern app-style sites frequently lock that document and own a
+            // nested viewport instead. Prefer the nearest scrollable ancestor
+            // under the XR gaze. If there is none, select the largest visible
+            // scrollable container before falling back to scrollingElement.
             EvaluateJS(
                 "(function(){var e=document.elementFromPoint(window.innerWidth*" + x +
-                ",window.innerHeight*" + y + "),s=e;" +
+                ",window.innerHeight*" + y + "),s=e,b=null,ba=0;" +
+                "var ok=function(n){if(!n)return false;var c=getComputedStyle(n);" +
+                "return n.scrollHeight>n.clientHeight+2&&" +
+                "/(auto|scroll|overlay)/.test(c.overflowY);};" +
                 "while(s&&s!==document.documentElement){var c=getComputedStyle(s);" +
-                "if(s.scrollHeight>s.clientHeight+2&&" +
-                "/(auto|scroll|overlay)/.test(c.overflowY)){s.scrollBy(0," + deltaY +
-                ");return;}s=s.parentElement;}window.scrollBy(0," + deltaY + ");})();");
+                "if(ok(s)){s.scrollBy(0," + deltaY + ");return;}s=s.parentElement;}" +
+                "var a=document.querySelectorAll('body *');" +
+                "for(var i=0;i<a.length;i++){var n=a[i];if(!ok(n))continue;" +
+                "var r=n.getBoundingClientRect(),w=Math.max(0,Math.min(r.right,innerWidth)-" +
+                "Math.max(r.left,0)),h=Math.max(0,Math.min(r.bottom,innerHeight)-" +
+                "Math.max(r.top,0)),ar=w*h;if(ar>ba){ba=ar;b=n;}}" +
+                "if(b){b.scrollBy(0," + deltaY + ");return;}" +
+                "var d=document.scrollingElement||document.documentElement||document.body;" +
+                "if(d)d.scrollBy(0," + deltaY + ");})();");
+        }
+
+        public void ScrollViewport(int deltaY)
+        {
+            if (deltaY == 0 || viewSize.x <= 0 || viewSize.y <= 0) return;
+            if (_viewportSwipeRunning) return;
+            StartCoroutine(SwipeViewportRoutine(Math.Sign(deltaY)));
+        }
+
+        private IEnumerator SwipeViewportRoutine(int direction)
+        {
+            if (direction == 0 || viewSize.x <= 0 || viewSize.y <= 0) yield break;
+            _viewportSwipeRunning = true;
+            int x = viewSize.x / 2;
+            int startY = Mathf.RoundToInt(
+                viewSize.y * (direction > 0 ? .86f : .14f));
+            int endY = Mathf.RoundToInt(
+                viewSize.y * (direction > 0 ? .14f : .86f));
+            // Some sites consume synthetic touch while nested WebView layouts
+            // ignore script scrolling. Drive both paths with complementary
+            // distances: together they equal roughly one page, and either path
+            // alone remains a useful deterministic step.
+            ScrollAt(
+                new Vector2Int(x, viewSize.y / 2),
+                Mathf.RoundToInt(direction * viewSize.y * .28f));
+            long downTime = TouchEvent(x, startY, 0, 0L);
+            const int steps = 12;
+            for (int step = 1; step <= steps; step++)
+            {
+                float t = step / (float)steps;
+                int y = Mathf.RoundToInt(Mathf.Lerp(startY, endY, t));
+                TouchEvent(x, y, 2, downTime);
+                RequestNativeRedraw();
+                yield return null;
+            }
+            TouchEvent(x, endY, 1, downTime);
+            RequestNativeRedraw();
+            _viewportSwipeRunning = false;
+            Debug.Log(
+                $"[XrLab] browser native swipe " +
+                $"{(direction > 0 ? "down" : "up")} completed.");
         }
 
         public void SetXrContentMode(bool enabled)
@@ -1941,6 +2431,14 @@ namespace MLOmega.XR.UI
 
     public sealed class XrLabBrowserWindow : MonoBehaviour
     {
+        // Android Presentation surfaces bypass Unity/XREAL's per-eye swapchain
+        // and are consequently shown by One Pro as a large flat cinema panel,
+        // even when their framebuffer is 3840x1080 SBS. Keep that experimental
+        // route available in source, but render WebVR through Unity XR so
+        // unity_StereoEyeIndex selects the correct source eye.
+        private const bool UseNativeExternalVrPresentation = false;
+        private const float BrowserEdgeCropPixels = 6f;
+
         [Serializable]
         private sealed class XrCropResult
         {
@@ -1951,8 +2449,11 @@ namespace MLOmega.XR.UI
             public float h;
             public float vw;
             public float vh;
+            public int videoWidth;
+            public int videoHeight;
             public string kind;
             public string detail;
+            public string hint;
         }
 
         private WorldCreatorLabShell _shell;
@@ -1966,6 +2467,7 @@ namespace MLOmega.XR.UI
         private Image _address;
         private RawImage _raw;
         private RectTransform _rawRect;
+        private XrLabBrowserPointer _browserPointer;
         private BoxCollider _addressCollider;
         private BoxCollider _viewportCollider;
         private Button _backButton;
@@ -1974,17 +2476,64 @@ namespace MLOmega.XR.UI
         private Button _downButton;
         private Button _keyboardButton;
         private Button _xrButton;
+        private Button _vrLayoutButton;
+        private Button _zoomOutButton;
+        private Button _zoomResetButton;
         private XrLabVolumeSlider _volumeSlider;
+        private XrLabWebVrPresenter _vrPresenter;
+        private XrLabWebVrStreamTexture _vrStreamTexture;
         private bool _xrMode;
+        private bool _nativeVrMode;
+        private bool _decodedVrMode;
         private bool _xrTransition;
+        private float _nativeVrStartedAt;
+        private float _nextNativeVrPose;
+        private string _nativeVrLayout = "auto";
+
+        /// <summary>
+        /// Emergency and gesture-safe exit for the native full-display VR player.
+        /// The Eye pipeline keeps running behind the Android Presentation, so a
+        /// sustained two-palm gesture can always restore the spatial browser.
+        /// </summary>
+        private void OnEnable()
+        {
+            GestureBridge.TwoPalmOverrideRequested += TryExitNativeVrFromTwoPalms;
+        }
+
+        private void OnDisable()
+        {
+            GestureBridge.TwoPalmOverrideRequested -= TryExitNativeVrFromTwoPalms;
+        }
+
+        private bool TryExitNativeVrFromTwoPalms()
+        {
+            if (!_nativeVrMode && !_decodedVrMode) return false;
+            ExitWebVrMode();
+            Debug.Log("[XrLabVR] immersive VR exited by two-palm gesture.");
+            return true;
+        }
         private Rect _xrRestoreUv;
         private Vector2 _xrRestoreSize;
+        private Vector2Int _xrRestoreViewSize;
+        private Vector2Int _xrRestoreTextureSize;
+        private int _xrRestoreFps;
+        private int _xrRestoreViewportWidth;
         private Vector3 _xrRestorePosition;
         private Quaternion _xrRestoreRotation;
         private Vector3 _xrRestoreScale;
         private float _nextUrlRefresh;
         private string _currentUrl;
         private int _focusProbeVersion;
+        private readonly Dictionary<GameObject, bool> _vrChildStates =
+            new Dictionary<GameObject, bool>();
+        private bool _browserChromeHidden;
+        private GameObject _immersiveControlsRoot;
+        private RectTransform _immersiveControlsRect;
+        private XrLabVrSeekSlider _immersiveSeek;
+        private TextMeshProUGUI _immersiveTimeLabel;
+        private Button _immersiveZoomReset;
+        private Button _immersivePlayPause;
+        private float _nextImmersiveControlsRefresh;
 
         public string Title { get; private set; }
         public string CurrentUrl => _currentUrl;
@@ -2037,13 +2586,16 @@ namespace MLOmega.XR.UI
             _backButton = MakeHeaderButton("‹", -500f, () => _browser.GoBack());
             _forwardButton = MakeHeaderButton("›", -440f, () => _browser.GoForward());
             _volumeSlider = MakeVolumeSlider(266f);
-            _xrButton = MakeHeaderButton("XR", 314f, ToggleXrVideoMode);
-            _upButton = MakeHeaderButton("↑", 326f, () => _browser.PageUp(false));
-            _downButton = MakeHeaderButton("↓", 386f, () => _browser.PageDown(false));
+            _xrButton = MakeHeaderButton("VR", 314f, ToggleVrVideoMode);
+            _vrLayoutButton = MakeHeaderButton("AUTO", 254f, CycleNativeVrLayout);
+            _zoomOutButton = MakeHeaderButton("−", 194f, () => _browser?.AdjustPageZoom(.80f));
+            _zoomResetButton = MakeHeaderButton("1:1", 134f, () => _browser?.ResetPageZoom());
+            _upButton = MakeHeaderButton("↑", 326f, HandleUpButton);
+            _downButton = MakeHeaderButton("↓", 386f, HandleDownButton);
             // The address bar itself remains the URL/search entry point. This
             // explicit keyboard button is essential on sites (notably YouTube)
             // whose scripted search control does not reliably expose focus.
-            _keyboardButton = MakeHeaderButton("ABC", 446f, OpenContentKeyboard);
+            _keyboardButton = MakeHeaderButton("ABC", 446f, HandleKeyboardButton);
 
             _address = MakeSurface(
                 _rect,
@@ -2072,14 +2624,14 @@ namespace MLOmega.XR.UI
             _raw = viewport.AddComponent<RawImage>();
             _raw.color = Color.white;
             _raw.raycastTarget = true;
-            // The native Android render host occasionally contributes its
-            // one-pixel top/left boundary to the captured texture. Crop two
-            // pixels on every edge; content and pointer mapping remain unchanged.
+            // The native Android render host can contribute a thin aliased rim
+            // to the captured texture. Crop six pixels on every edge; pointer
+            // mapping follows uvRect, so content interaction stays aligned.
             _raw.uvRect = new Rect(
-                2f / 1080f,
-                2f / 608f,
-                1f - 4f / 1080f,
-                1f - 4f / 608f);
+                BrowserEdgeCropPixels / 1080f,
+                BrowserEdgeCropPixels / 608f,
+                1f - BrowserEdgeCropPixels * 2f / 1080f,
+                1f - BrowserEdgeCropPixels * 2f / 608f);
             _rawRect = _raw.rectTransform;
             _rawRect.anchorMin = _rawRect.anchorMax = new Vector2(.5f, .5f);
             _rawRect.anchoredPosition = new Vector2(0f, -42f);
@@ -2087,8 +2639,8 @@ namespace MLOmega.XR.UI
             _viewportCollider = viewport.AddComponent<BoxCollider>();
             _viewportCollider.size = new Vector3(1060f, 596f, 14f);
             _browser = viewport.AddComponent<XrLabWebView>();
-            var pointer = viewport.AddComponent<XrLabBrowserPointer>();
-            pointer.Configure(this, _browser, _rawRect);
+            _browserPointer = viewport.AddComponent<XrLabBrowserPointer>();
+            _browserPointer.Configure(this, _browser, _rawRect);
             _browser.Configure(_raw, _currentUrl);
             ApplyWindowSize(_rect.sizeDelta, false);
         }
@@ -2101,6 +2653,29 @@ namespace MLOmega.XR.UI
                 () => _shell.CloseWindow(this),
                 ApplyWindowSize,
                 ApplyWindowCrop);
+        }
+
+        internal void PrepareClose()
+        {
+            if (_nativeVrMode) _browser?.StopNativeVrStream();
+            if (_decodedVrMode)
+            {
+                _vrStreamTexture?.StopCapture();
+                _browser?.SetVrSourcePagePaused(false);
+            }
+            _nativeVrMode = false;
+            _decodedVrMode = false;
+            _browser?.ShutdownNow();
+            if (_immersiveControlsRoot != null)
+            {
+                Destroy(_immersiveControlsRoot);
+                _immersiveControlsRoot = null;
+            }
+            if (_raw != null)
+            {
+                _raw.enabled = false;
+                _raw.texture = null;
+            }
         }
 
         private void ApplyWindowCrop(Vector4 normalizedInsets, bool final)
@@ -2118,6 +2693,11 @@ namespace MLOmega.XR.UI
                 Mathf.Clamp(requested.x, 620f, 2600f),
                 Mathf.Clamp(requested.y, 360f, 1200f));
             _rect.sizeDelta = size;
+            if (_xrMode)
+            {
+                ApplyVrToolbar(size);
+                return;
+            }
             float halfWidth = size.x * .5f;
             float halfHeight = size.y * .5f;
             const float sideGutter = 30f;
@@ -2132,7 +2712,10 @@ namespace MLOmega.XR.UI
             float headerY = halfHeight - verticalGutter - 36f;
             // Reserve navigation on the left and XR/media/page controls on the
             // right. The URL is clipped by its own mask, never over the buttons.
-            float addressWidth = Mathf.Max(150f, size.x - 480f);
+            float addressLeft = -halfWidth + 160f;
+            float addressRight = halfWidth - 510f;
+            float addressWidth = Mathf.Max(120f, addressRight - addressLeft);
+            float addressX = addressRight - addressWidth * .5f;
             Vector2 contentSize = _xrMode
                 ? new Vector2(
                     Mathf.Max(520f, size.x - 80f),
@@ -2158,12 +2741,18 @@ namespace MLOmega.XR.UI
             LayoutButton(_forwardButton, new Vector2(-halfWidth + 120f, headerY));
             LayoutVolumeSlider(
                 _volumeSlider,
-                new Vector2(halfWidth - 294f, headerY));
+                new Vector2(halfWidth - 474f, headerY));
+            LayoutButton(_zoomResetButton, new Vector2(halfWidth - 426f, headerY));
+            LayoutButton(_zoomOutButton, new Vector2(halfWidth - 366f, headerY));
+            LayoutButton(_vrLayoutButton, new Vector2(halfWidth - 306f, headerY));
             LayoutButton(_xrButton, new Vector2(halfWidth - 246f, headerY));
             LayoutButton(_upButton, new Vector2(halfWidth - 186f, headerY));
             LayoutButton(_downButton, new Vector2(halfWidth - 126f, headerY));
             LayoutButton(_keyboardButton, new Vector2(halfWidth - 66f, headerY));
             _xrButton.gameObject.SetActive(!_xrMode);
+            _vrLayoutButton.gameObject.SetActive(!_xrMode);
+            _zoomOutButton.gameObject.SetActive(!_xrMode);
+            _zoomResetButton.gameObject.SetActive(!_xrMode);
             _volumeSlider.gameObject.SetActive(!_xrMode);
             _backButton.gameObject.SetActive(!_xrMode);
             _forwardButton.gameObject.SetActive(!_xrMode);
@@ -2173,7 +2762,7 @@ namespace MLOmega.XR.UI
             _address.gameObject.SetActive(!_xrMode);
             LayoutSurface(
                 _address,
-                new Vector2(-90f, headerY),
+                new Vector2(addressX, headerY),
                 new Vector2(addressWidth, 50f));
             if (_addressCollider != null)
                 _addressCollider.size = new Vector3(addressWidth, 50f, 16f);
@@ -2220,17 +2809,75 @@ namespace MLOmega.XR.UI
             _browser.SetXrViewportWidth(textureWidth);
             if (_raw != null)
                 _raw.uvRect = new Rect(
-                    2f / textureWidth,
-                    2f / textureHeight,
-                    1f - 4f / textureWidth,
-                    1f - 4f / textureHeight);
+                    BrowserEdgeCropPixels / textureWidth,
+                    BrowserEdgeCropPixels / textureHeight,
+                    1f - BrowserEdgeCropPixels * 2f / textureWidth,
+                    1f - BrowserEdgeCropPixels * 2f / textureHeight);
             _browser.RequestNativeRedraw();
+        }
+
+        private void ApplyVrToolbar(Vector2 windowSize)
+        {
+            float toolbarY = -windowSize.y * .5f + 64f;
+            LayoutSurface(
+                _header,
+                new Vector2(0f, toolbarY),
+                new Vector2(440f, 72f));
+            _header.gameObject.SetActive(true);
+            _frame.gameObject.SetActive(false);
+            _address.gameObject.SetActive(false);
+            _backButton.gameObject.SetActive(false);
+            _forwardButton.gameObject.SetActive(false);
+            _vrLayoutButton.gameObject.SetActive(false);
+            _zoomOutButton.gameObject.SetActive(false);
+            _zoomResetButton.gameObject.SetActive(false);
+
+            LayoutVolumeSlider(_volumeSlider, new Vector2(-160f, toolbarY));
+            LayoutButton(_xrButton, new Vector2(-100f, toolbarY));
+            LayoutButton(_upButton, new Vector2(-40f, toolbarY));
+            LayoutButton(_downButton, new Vector2(30f, toolbarY));
+            LayoutButton(_keyboardButton, new Vector2(100f, toolbarY));
+            _volumeSlider.gameObject.SetActive(true);
+            _xrButton.gameObject.SetActive(true);
+            _upButton.gameObject.SetActive(true);
+            _downButton.gameObject.SetActive(true);
+            _keyboardButton.gameObject.SetActive(true);
+
+            if (_raw != null) _raw.enabled = false;
+            if (_viewportCollider != null) _viewportCollider.enabled = false;
+            UpdateVrToolbarLabels();
+            _creator?.RefreshExternalSpatialWindow(_rect);
         }
 
         private void Update()
         {
+            if (_xrMode && _vrPresenter != null && _vrPresenter.Active)
+            {
+                RefreshImmersiveControls();
+            }
             if (_browser == null || _browser.state != FragmentCapture.State.Initialized)
                 return;
+            if (_nativeVrMode)
+            {
+                if (Time.unscaledTime >= _nextNativeVrPose)
+                {
+                    _nextNativeVrPose = Time.unscaledTime + (1f / 60f);
+                    Vector3 direction = _camera.transform.forward.normalized;
+                    float yaw = Mathf.Atan2(direction.x, direction.z) * Mathf.Rad2Deg;
+                    float pitch = Mathf.Asin(Mathf.Clamp(direction.y, -1f, 1f)) *
+                                  Mathf.Rad2Deg;
+                    _browser.SetNativeVrHeadPose(yaw, pitch);
+                }
+                if (!_xrTransition && Time.unscaledTime > _nativeVrStartedAt + 2f &&
+                    !_browser.IsNativeVrStreamActive())
+                {
+                    Debug.LogWarning(
+                        "[XrLabVR] native presentation closed: " +
+                        _browser.NativeVrStatus());
+                    ExitWebVrMode();
+                    return;
+                }
+            }
             if (Time.unscaledTime < _nextUrlRefresh) return;
             _nextUrlRefresh = Time.unscaledTime + .75f;
             string current = _browser.GetUrl();
@@ -2246,7 +2893,10 @@ namespace MLOmega.XR.UI
 
         public void SetFocused(bool focused)
         {
-            _browser?.SetTargetFps(focused ? 15 : 3);
+            _browser?.SetTargetFps(
+                _nativeVrMode || _decodedVrMode
+                    ? 3
+                    : _xrMode ? 30 : focused ? 15 : 3);
         }
 
         public void Navigate(string url)
@@ -2290,60 +2940,377 @@ namespace MLOmega.XR.UI
             _shell.BeginWebContentEntry(this);
         }
 
-        private void ToggleXrVideoMode()
+        private void HandleUpButton()
         {
-            if (_rect == null || _camera == null) return;
-            if (_xrTransition) return;
-            Debug.Log($"[XrLab] XR header activated mode={_xrMode} url={_currentUrl}");
             if (!_xrMode)
             {
-                StartCoroutine(EnterXrCropMode());
+                int amount = _browser == null
+                    ? 420
+                    : Mathf.Max(240, Mathf.RoundToInt(_browser.viewSize.y * .72f));
+                _browser?.ScrollViewport(-amount);
+                return;
+            }
+            _vrPresenter?.CycleVr180Layout();
+            UpdateVrToolbarLabels();
+        }
+
+        private void HandleDownButton()
+        {
+            if (!_xrMode)
+            {
+                int amount = _browser == null
+                    ? 420
+                    : Mathf.Max(240, Mathf.RoundToInt(_browser.viewSize.y * .72f));
+                _browser?.ScrollViewport(amount);
+                return;
+            }
+            _vrPresenter?.CycleWideProjection();
+            UpdateVrToolbarLabels();
+        }
+
+        private void HandleKeyboardButton()
+        {
+            if (!_xrMode)
+            {
+                OpenContentKeyboard();
+                return;
+            }
+            _vrPresenter?.Recenter();
+        }
+
+        private void ToggleVrVideoMode()
+        {
+            if (_rect == null || _camera == null || _xrTransition) return;
+            Debug.Log($"[XrLabVR] button activated mode={_xrMode} url={_currentUrl}");
+            if (!_xrMode)
+                StartCoroutine(EnterWebVrMode());
+            else
+                ExitWebVrMode();
+        }
+
+        private void CycleNativeVrLayout()
+        {
+            _nativeVrLayout = _nativeVrLayout == "auto"
+                ? "sbs"
+                : _nativeVrLayout == "sbs"
+                    ? "mono"
+                    : _nativeVrLayout == "mono" ? "tb" : "auto";
+            SetButtonLabel(_vrLayoutButton, _nativeVrLayout.ToUpperInvariant());
+            Debug.Log("[XrLabVR] source layout selected: " + _nativeVrLayout);
+        }
+
+        private void ExitWebVrMode()
+        {
+            if (_xrTransition) return;
+            StartCoroutine(ExitWebVrModeRoutine());
+        }
+
+        private IEnumerator ExitWebVrModeRoutine()
+        {
+            _xrTransition = true;
+            SetImmersiveControlsVisible(false);
+            bool native = _nativeVrMode;
+            bool decoded = _decodedVrMode;
+            if (native)
+            {
+                _browser?.StopNativeVrStream();
+                float timeout = Time.realtimeSinceStartup + 1.5f;
+                while (_browser != null && _browser.IsNativeVrStreamActive() &&
+                       Time.realtimeSinceStartup < timeout)
+                    yield return null;
+                // Let SurfaceFlinger remove the external Presentation before
+                // making Chromium's capture host visible again.
+                yield return new WaitForEndOfFrame();
+                yield return new WaitForSecondsRealtime(.18f);
             }
             else
             {
-                _xrMode = false;
-                ApplyWindowSize(_xrRestoreSize, false);
-                _rect.SetPositionAndRotation(
-                    _xrRestorePosition,
-                    _xrRestoreRotation);
-                _rect.localScale = _xrRestoreScale;
-                if (_raw != null) _raw.uvRect = _xrRestoreUv;
-                _creator?.RefreshExternalSpatialWindow(_rect);
-                _browser?.RequestNativeRedraw();
+                if (decoded)
+                {
+                    _vrStreamTexture?.StopCapture();
+                    _browser?.SetVrSourcePagePaused(false);
+                    yield return new WaitForEndOfFrame();
+                }
+                _vrPresenter?.Exit();
             }
+            _nativeVrMode = false;
+            _decodedVrMode = false;
+            _browser?.EvaluateJS(XrLabWebVrScript.RestoreRawVideo);
+            _xrMode = false;
+            SetBrowserChromeVisible(true, false);
+            if (_raw != null)
+            {
+                _raw.enabled = true;
+                _raw.uvRect = _xrRestoreUv;
+            }
+            if (_viewportCollider != null) _viewportCollider.enabled = true;
+            ApplyWindowSize(_xrRestoreSize, false);
+            _rect.SetPositionAndRotation(
+                _xrRestorePosition,
+                _xrRestoreRotation);
+            _rect.localScale = _xrRestoreScale;
+            if (native || decoded)
+                yield return RecreateWebViewAfterVr();
+            else
+                RestoreWebVrCapture();
+            _browser?.RequestNativeRedraw();
+            UpdateVrToolbarLabels();
+            _creator?.RefreshExternalSpatialWindow(_rect);
+            _xrTransition = false;
         }
 
-        private IEnumerator EnterXrCropMode()
+        private IEnumerator RecreateWebViewAfterVr()
+        {
+            // On Android 16 the Media3/SurfaceTexture transition can leave
+            // TLab's Chromium capture compositor permanently grey. Reloading
+            // the URL does not replace that compositor, while closing and
+            // reopening the spatial browser does. Recreate only the hidden
+            // WebView component here: the world-space window, its pose, size,
+            // controls and pointer all remain untouched, and Chromium's process
+            // cookie jar keeps authenticated sessions.
+            XrLabWebView retired = _browser;
+            _browser = null;
+            if (retired != null)
+            {
+                retired.ShutdownNow();
+                Destroy(retired);
+            }
+            if (_raw != null)
+            {
+                _raw.enabled = true;
+                _raw.texture = null;
+            }
+            yield return new WaitForEndOfFrame();
+            yield return new WaitForSecondsRealtime(.12f);
+            if (_raw == null) yield break;
+
+            _browser = _raw.gameObject.AddComponent<XrLabWebView>();
+            _browserPointer?.Configure(this, _browser, _rawRect);
+            _browser.Configure(_raw, _currentUrl);
+            _browser.SetXrViewportWidth(
+                _xrRestoreViewportWidth > 0 ? _xrRestoreViewportWidth : 1080);
+            _browser.SetTargetFps(_xrRestoreFps > 0 ? _xrRestoreFps : 15);
+            Debug.Log(
+                "[XrLabVR] browser compositor recreated after immersive exit.");
+        }
+
+        private void RestoreWebVrCapture()
+        {
+            if (_browser == null) return;
+            Vector2Int view = _xrRestoreViewSize.x > 0 && _xrRestoreViewSize.y > 0
+                ? _xrRestoreViewSize
+                : new Vector2Int(1080, 608);
+            Vector2Int texture =
+                _xrRestoreTextureSize.x > 0 && _xrRestoreTextureSize.y > 0
+                    ? _xrRestoreTextureSize
+                    : view;
+            _browser.Resize(texture, view);
+            _browser.SetXrViewportWidth(
+                _xrRestoreViewportWidth > 0 ? _xrRestoreViewportWidth : view.x);
+            _browser.SetTargetFps(_xrRestoreFps > 0 ? _xrRestoreFps : 15);
+            _browser.RequestNativeRedraw();
+        }
+
+        private void AbortWebVrTransition(string reason)
+        {
+            Debug.LogWarning("[XrLabVR] " + reason);
+            _browser?.EvaluateJS(XrLabWebVrScript.RestoreRawVideo);
+            if (_nativeVrMode) _browser?.StopNativeVrStream();
+            if (_decodedVrMode || _vrStreamTexture != null)
+            {
+                _vrStreamTexture?.StopCapture();
+                _browser?.SetVrSourcePagePaused(false);
+            }
+            _vrPresenter?.Exit();
+            SetImmersiveControlsVisible(false);
+            _nativeVrMode = false;
+            _decodedVrMode = false;
+            _xrMode = false;
+            SetBrowserChromeVisible(true, false);
+            if (_raw != null)
+            {
+                _raw.enabled = true;
+                _raw.uvRect = _xrRestoreUv;
+            }
+            if (_viewportCollider != null) _viewportCollider.enabled = true;
+            ApplyWindowSize(_xrRestoreSize, false);
+            RestoreWebVrCapture();
+            UpdateVrToolbarLabels();
+            _xrTransition = false;
+        }
+
+        private IEnumerator EnterWebVrMode()
         {
             if (_browser == null || _raw == null) yield break;
             _xrTransition = true;
-            const string script =
-                "try{var vw=innerWidth||document.documentElement.clientWidth;" +
-                "var vh=innerHeight||document.documentElement.clientHeight;var e=null;" +
-                "var a=[].slice.call(document.querySelectorAll('video'));" +
-                "for(var i=0;i<a.length;i++){var q=a[i].getBoundingClientRect();" +
-                "if(q.width>120&&q.height>70&&q.bottom>0&&q.right>0){e=a[i];if(!a[i].paused)break;}}" +
-                "if(!e)e=document.querySelector('#movie_player,.html5-video-player,ytm-player," +
-                "ytm-watch-media,#player-control-container,.player-container,.video-player,iframe,canvas');" +
-                "if(!e){var p=document.elementFromPoint(vw*.35,vh*.35);" +
-                "for(var n=0;p&&n<10;n++,p=p.parentElement){var z=p.getBoundingClientRect();" +
-                "var ar=z.height>0?z.width/z.height:0;if(z.width>240&&z.height>120&&ar>1.25&&ar<2.6){e=p;break;}}}" +
-                "var host=String(location.hostname||'');var detail='videos='+a.length+',host='+host;" +
-                "if(!e&&host.indexOf('youtube.com')>=0){var top=Math.min(48,vh*.08);" +
-                "var width=Math.min(vw,vh*1.36);var height=Math.min(vh-top,width*9/16);" +
-                "tlab.postResult(xrResultId,JSON.stringify({ok:true,x:0,y:top,w:width,h:height," +
-                "vw:vw,vh:vh,kind:'YOUTUBE_GEOMETRY',detail:detail}));}" +
-                "else if(!e){tlab.postResult(xrResultId,JSON.stringify({ok:false,detail:detail}));}" +
-                "else{var r=e.getBoundingClientRect();var l=Math.max(0,r.left),t=Math.max(0,r.top);" +
-                "var rr=Math.min(vw,r.right),bb=Math.min(vh,r.bottom);" +
-                "tlab.postResult(xrResultId,JSON.stringify({ok:rr-l>48&&bb-t>32,x:l,y:t,w:rr-l,h:bb-t," +
-                "vw:vw,vh:vh,kind:String(e.tagName||'NODE')+'#'+String(e.id||''),detail:detail}));}}" +
-                "catch(err){tlab.postResult(xrResultId,JSON.stringify({ok:false," +
-                "detail:'js:'+String(err&&err.name)+':'+String(err&&err.message)}));}";
+
+            _xrRestoreSize = _rect.sizeDelta;
+            _xrRestorePosition = _rect.position;
+            _xrRestoreRotation = _rect.rotation;
+            _xrRestoreScale = _rect.localScale;
+            _xrRestoreUv = _raw.uvRect;
+            _xrRestoreViewSize = _browser.viewSize;
+            _xrRestoreTextureSize = _browser.texSize;
+            _xrRestoreFps = _browser.TargetFps;
+            _xrRestoreViewportWidth = _browser.XrViewportWidth;
+
+            // Primary route for logged-in players: Media3 consumes the observed
+            // authenticated stream into TLab's HardwareBuffer. Unity imports that
+            // GPU texture and the XREAL shader selects the correct SBS half for
+            // each eye. No Android Presentation or flat cinema layer is involved.
+            int streamAttempt = 0;
+            while (streamAttempt < 6 &&
+                   _browser.TryGetCapturedVrStream(out string streamDescriptor))
+            {
+                streamAttempt++;
+                if (_vrStreamTexture == null)
+                    _vrStreamTexture = gameObject.AddComponent<XrLabWebVrStreamTexture>();
+                if (_vrStreamTexture.StartCapture(
+                        streamDescriptor,
+                        3840,
+                        1920,
+                        30,
+                        _nativeVrLayout))
+                {
+                    float startedAt = Time.realtimeSinceStartup;
+                    float timeoutAt = startedAt + 18f;
+                    while (!_vrStreamTexture.Ready &&
+                           Time.realtimeSinceStartup < timeoutAt)
+                    {
+                        if (_vrStreamTexture.RejectedPreview)
+                            break;
+                        if (Time.realtimeSinceStartup > startedAt + .5f &&
+                            !_browser.IsNativeVrStreamActive())
+                            break;
+                        yield return null;
+                    }
+
+                    // Resolution alone cannot distinguish a 720p pre-roll from
+                    // a real VR stream. Give Media3's cached duration one short
+                    // moment to arrive, then reject short HD interstitials and
+                    // continue through the captured candidate history.
+                    if (_vrStreamTexture.Ready &&
+                        _vrStreamTexture.PlaybackDurationMs <= 0L)
+                    {
+                        float metadataTimeout = Time.realtimeSinceStartup + .8f;
+                        while (_vrStreamTexture.PlaybackDurationMs <= 0L &&
+                               Time.realtimeSinceStartup < metadataTimeout)
+                            yield return null;
+                    }
+
+                    if (_vrStreamTexture.LikelyInterstitial)
+                    {
+                        long rejectedDuration =
+                            _vrStreamTexture.PlaybackDurationMs;
+                        int rejectedWidth = _vrStreamTexture.VideoWidth;
+                        int rejectedHeight = _vrStreamTexture.VideoHeight;
+                        _vrStreamTexture.StopCapture();
+                        bool hasAlternative = _browser.RejectCapturedVrStream();
+                        Debug.LogWarning(
+                            $"[XrLabVR] short interstitial candidate " +
+                            $"{streamAttempt} rejected ({rejectedWidth}x" +
+                            $"{rejectedHeight}, {rejectedDuration}ms); " +
+                            $"alternative={hasAlternative}.");
+                        if (hasAlternative)
+                        {
+                            yield return null;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if (_vrStreamTexture.RejectedPreview)
+                    {
+                        int rejectedWidth = _vrStreamTexture.VideoWidth;
+                        int rejectedHeight = _vrStreamTexture.VideoHeight;
+                        _vrStreamTexture.StopCapture();
+                        bool hasAlternative = _browser.RejectCapturedVrStream();
+                        Debug.LogWarning(
+                            $"[XrLabVR] preview/non-VR candidate {streamAttempt} " +
+                            $"rejected ({rejectedWidth}x{rejectedHeight}); " +
+                            $"alternative={hasAlternative}.");
+                        if (hasAlternative)
+                        {
+                            yield return null;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if (_vrStreamTexture.Ready)
+                    {
+                        if (_vrPresenter == null)
+                            _vrPresenter = gameObject.AddComponent<XrLabWebVrPresenter>();
+                        string projection = _vrStreamTexture.ProjectionAngle >= 300
+                            ? "360"
+                            : "vr180";
+                        if (_vrPresenter.Enter(
+                                _camera,
+                                _vrStreamTexture.Texture,
+                                new Rect(0f, 0f, 1f, 1f),
+                                _vrStreamTexture.VideoWidth,
+                                _vrStreamTexture.VideoHeight,
+                                projection + " " + _vrStreamTexture.StereoMode +
+                                " " + (_currentUrl ?? string.Empty)))
+                        {
+                            _browser.SetVrSourcePagePaused(true);
+                            _decodedVrMode = true;
+                            _xrMode = true;
+                            _browser.SetTargetFps(3);
+                            _raw.enabled = false;
+                            if (_viewportCollider != null)
+                                _viewportCollider.enabled = false;
+                            // Media3 owns the VR texture now. Disable every
+                            // browser child, including the CPU ByteBuffer host,
+                            // while keeping this root alive for two-palm exit.
+                            SetBrowserChromeVisible(false, false);
+                            SetImmersiveControlsVisible(true);
+                            UpdateVrToolbarLabels();
+                            Debug.Log(
+                                "[XrLabVR] authenticated stream fused in the " +
+                                "Unity/XREAL per-eye renderer " +
+                                $"({_vrStreamTexture.VideoWidth}x" +
+                                $"{_vrStreamTexture.VideoHeight}, " +
+                                $"{_vrStreamTexture.StereoMode}).");
+                            _xrTransition = false;
+                            yield break;
+                        }
+                    }
+
+                    Debug.LogWarning(
+                        "[XrLabVR] authenticated Unity texture unavailable: " +
+                        _browser.NativeVrStatus());
+                    _vrStreamTexture.StopCapture();
+                }
+
+                bool retry = _browser.RejectCapturedVrStream();
+                Debug.LogWarning(
+                    $"[XrLabVR] stream candidate {streamAttempt} failed; " +
+                    $"alternative={retry}.");
+                if (!retry) break;
+                yield return null;
+            }
+
+            Debug.Log(
+                "[XrLabVR] Unity/XREAL per-eye path selected; " +
+                "external Android Presentation disabled.");
+
+            // VR180 spends half of the source width on each eye. Always capture
+            // the raw browser video at the largest proven Lab resolution before
+            // splitting it; the normal window resolution is restored on exit.
+            var vrResolution = new Vector2Int(1920, 1080);
+            _browser.Resize(vrResolution, vrResolution);
+            _browser.SetXrViewportWidth(vrResolution.x);
+            _browser.SetTargetFps(30);
+            _browser.RequestNativeRedraw();
+            yield return new WaitForEndOfFrame();
+            yield return new WaitForEndOfFrame();
 
             XrCropResult crop = null;
             foreach (JavaAsyncResult result in
-                _browser.EvaluateJSForResult("xrResultId", script))
+                _browser.EvaluateJSForResult(
+                    "xrResultId",
+                    XrLabWebVrScript.ProbeAndExposeRawVideo))
             {
                 if (result == null)
                 {
@@ -2351,7 +3318,7 @@ namespace MLOmega.XR.UI
                     continue;
                 }
                 Debug.Log(
-                    $"[XrLab] XR probe result status={result.status} " +
+                    $"[XrLabVR] probe result status={result.status} " +
                     $"payload={(string.IsNullOrWhiteSpace(result.s) ? "<empty>" : result.s)}");
                 if (
                     result.status == JavaAsyncResult.Status.COMPLETE &&
@@ -2363,7 +3330,7 @@ namespace MLOmega.XR.UI
                     }
                     catch (Exception exception)
                     {
-                        Debug.LogWarning("[XrLab] XR crop parse failed: " + exception.Message);
+                        Debug.LogWarning("[XrLabVR] probe parse failed: " + exception.Message);
                     }
                 }
             }
@@ -2372,38 +3339,260 @@ namespace MLOmega.XR.UI
                 crop == null || !crop.ok || crop.vw <= 0f || crop.vh <= 0f ||
                 crop.w <= 0f || crop.h <= 0f)
             {
-                Debug.LogWarning(
-                    "[XrLab] XR crop refused: no visible video/player surface. " +
+                AbortWebVrTransition(
+                    "refused: no visible video/player surface. " +
                     (crop != null ? crop.detail : "no-result"));
-                _xrTransition = false;
                 yield break;
             }
-
-            _xrRestoreSize = _rect.sizeDelta;
-            _xrRestorePosition = _rect.position;
-            _xrRestoreRotation = _rect.rotation;
-            _xrRestoreScale = _rect.localScale;
-            _xrRestoreUv = _raw.uvRect;
-            _xrMode = true;
-            ApplyWindowSize(new Vector2(1680f, 1040f), false);
 
             float left = Mathf.Clamp01(crop.x / crop.vw);
             float bottom = Mathf.Clamp01(1f - (crop.y + crop.h) / crop.vh);
             float width = Mathf.Clamp01(crop.w / crop.vw);
             float height = Mathf.Clamp01(crop.h / crop.vh);
-            _raw.uvRect = new Rect(left, bottom, width, height);
+            Rect videoRect = new Rect(left, bottom, width, height);
 
-            Vector3 forward = _camera.transform.forward.normalized;
-            _rect.SetPositionAndRotation(
-                _camera.transform.position + forward * 1.05f,
-                Quaternion.LookRotation(forward, Vector3.up));
-            _creator?.RefreshExternalSpatialWindow(_rect);
-            _browser.RequestNativeRedraw();
+            if (_vrPresenter == null)
+                _vrPresenter = gameObject.AddComponent<XrLabWebVrPresenter>();
+            if (!_vrPresenter.Enter(
+                    _camera,
+                    _raw,
+                    videoRect,
+                    crop.videoWidth,
+                    crop.videoHeight,
+                    (_currentUrl ?? string.Empty) + " " + (crop.hint ?? string.Empty)))
+            {
+                AbortWebVrTransition("presenter rejected the captured surface.");
+                yield break;
+            }
+
+            _xrMode = true;
+            _browser.SetTargetFps(30);
+            ApplyWindowSize(_xrRestoreSize, false);
+            // Fallback projection still samples the WebView texture, so retain
+            // its capture component but hide all browser chrome and colliders.
+            SetBrowserChromeVisible(false, true);
+            SetImmersiveControlsVisible(true);
             Debug.Log(
-                $"[XrLab] XR crop active kind={crop.kind} " +
+                $"[XrLabVR] active kind={crop.kind} " +
                 $"rect={crop.x:F0},{crop.y:F0},{crop.w:F0},{crop.h:F0} " +
-                $"viewport={crop.vw:F0}x{crop.vh:F0}.");
+                $"viewport={crop.vw:F0}x{crop.vh:F0} mode={_vrPresenter.ModeLabel}.");
             _xrTransition = false;
+        }
+
+        private void SetBrowserChromeVisible(bool visible, bool keepViewportCapture)
+        {
+            if (_rect == null) return;
+            if (!visible)
+            {
+                if (_browserChromeHidden) return;
+                _vrChildStates.Clear();
+                for (int index = 0; index < _rect.childCount; index++)
+                {
+                    GameObject child = _rect.GetChild(index).gameObject;
+                    _vrChildStates[child] = child.activeSelf;
+                    bool keep = keepViewportCapture && _raw != null &&
+                                child == _raw.gameObject;
+                    if (!keep) child.SetActive(false);
+                }
+                // The fallback keeps XrLabWebView.Update alive on this object,
+                // but neither the image nor its collider may cover immersive VR.
+                if (keepViewportCapture && _raw != null) _raw.enabled = false;
+                if (_viewportCollider != null) _viewportCollider.enabled = false;
+                _browserChromeHidden = true;
+                return;
+            }
+
+            if (!_browserChromeHidden) return;
+            foreach (KeyValuePair<GameObject, bool> state in _vrChildStates)
+            {
+                if (state.Key != null) state.Key.SetActive(state.Value);
+            }
+            _vrChildStates.Clear();
+            _browserChromeHidden = false;
+        }
+
+        private void EnsureImmersiveControls()
+        {
+            if (_immersiveControlsRoot != null) return;
+
+            _immersiveControlsRoot = new GameObject("XReel Immersive Controls");
+            Canvas canvas = _immersiveControlsRoot.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.WorldSpace;
+            canvas.worldCamera = _camera;
+            canvas.sortingOrder = 260;
+            _immersiveControlsRoot.AddComponent<GraphicRaycaster>();
+            _immersiveControlsRect =
+                _immersiveControlsRoot.GetComponent<RectTransform>();
+            _immersiveControlsRect.sizeDelta = new Vector2(820f, 104f);
+            _immersiveControlsRect.localScale = Vector3.one * .00068f;
+
+            Image panel = MakeSurface(
+                _immersiveControlsRect,
+                "Immersive control glass",
+                Vector2.zero,
+                _immersiveControlsRect.sizeDelta,
+                new Color(.055f, .06f, .075f, .72f));
+            panel.raycastTarget = false;
+
+            MakeImmersiveButton("?", -362f, () =>
+            {
+                _vrPresenter?.AdjustZoom(-.10f);
+                RefreshImmersiveControls(true);
+            });
+            _immersiveZoomReset = MakeImmersiveButton("100%", -302f, () =>
+            {
+                _vrPresenter?.ResetZoom();
+                RefreshImmersiveControls(true);
+            }, 72f);
+            MakeImmersiveButton("+", -232f, () =>
+            {
+                _vrPresenter?.AdjustZoom(.10f);
+                RefreshImmersiveControls(true);
+            });
+            _immersivePlayPause = MakeImmersiveButton("II", -174f, () =>
+            {
+                _vrStreamTexture?.TogglePlayback();
+                RefreshImmersiveControls(true);
+            });
+
+            Image timeline = MakeSurface(
+                _immersiveControlsRect,
+                "Immersive timeline",
+                new Vector2(76f, 10f),
+                new Vector2(392f, 30f),
+                new Color(.24f, .26f, .31f, .92f));
+            timeline.raycastTarget = true;
+            BoxCollider timelineCollider = timeline.gameObject.AddComponent<BoxCollider>();
+            timelineCollider.size = new Vector3(392f, 42f, 18f);
+            Image fill = MakeSurface(
+                timeline.transform,
+                "Immersive timeline fill",
+                Vector2.zero,
+                new Vector2(4f, 8f),
+                new Color(.84f, .90f, 1f, .98f));
+            fill.raycastTarget = false;
+            _immersiveSeek = timeline.gameObject.AddComponent<XrLabVrSeekSlider>();
+            _immersiveSeek.Configure(
+                fill,
+                () => _vrStreamTexture != null
+                    ? _vrStreamTexture.PlaybackNormalized
+                    : 0f,
+                normalized => _vrStreamTexture?.SeekNormalized(normalized));
+
+            _immersiveTimeLabel = MakeLabel(
+                _immersiveControlsRect,
+                "--:-- / --:--",
+                new Vector2(76f, -27f),
+                new Vector2(392f, 24f),
+                15f,
+                new Color(.82f, .85f, .91f, .94f),
+                TextAlignmentOptions.Center);
+
+            MakeImmersiveButton("?", 374f, ExitWebVrMode);
+            _immersiveControlsRoot.SetActive(false);
+        }
+
+        private Button MakeImmersiveButton(
+            string label,
+            float x,
+            UnityEngine.Events.UnityAction action,
+            float width = 48f)
+        {
+            Button button = WorldCreatorLabShell.MakeButton(
+                _immersiveControlsRect,
+                label,
+                new Vector2(x, 0f),
+                new Vector2(width, 48f),
+                action);
+            return button;
+        }
+
+        private void SetImmersiveControlsVisible(bool visible)
+        {
+            if (visible) EnsureImmersiveControls();
+            if (_immersiveControlsRoot == null) return;
+            _immersiveControlsRoot.SetActive(visible);
+            if (visible)
+            {
+                _nextImmersiveControlsRefresh = 0f;
+                UpdateImmersiveControlsPose();
+                RefreshImmersiveControls(true);
+            }
+        }
+
+        private void UpdateImmersiveControlsPose()
+        {
+            if (_immersiveControlsRect == null || _camera == null ||
+                !_immersiveControlsRoot.activeSelf)
+                return;
+            Vector3 forward = Vector3.ProjectOnPlane(
+                _camera.transform.forward, Vector3.up).normalized;
+            if (forward.sqrMagnitude < .01f) forward = _camera.transform.forward;
+            _immersiveControlsRect.SetPositionAndRotation(
+                _camera.transform.position + forward * 1.20f + Vector3.down * .58f,
+                Quaternion.LookRotation(forward, Vector3.up));
+        }
+
+        private void RefreshImmersiveControls(bool force = false)
+        {
+            if (!force && Time.unscaledTime < _nextImmersiveControlsRefresh) return;
+            _nextImmersiveControlsRefresh = Time.unscaledTime + .20f;
+            _immersiveSeek?.Refresh();
+            if (_immersiveZoomReset != null && _vrPresenter != null)
+                SetButtonLabel(_immersiveZoomReset, _vrPresenter.ZoomLabel);
+            if (_immersivePlayPause != null && _vrStreamTexture != null)
+                SetButtonLabel(
+                    _immersivePlayPause,
+                    _vrStreamTexture.IsPlaying ? "II" : "\u25B6");
+            if (_immersiveTimeLabel != null)
+            {
+                long position = _vrStreamTexture != null
+                    ? _vrStreamTexture.PlaybackPositionMs
+                    : 0L;
+                long duration = _vrStreamTexture != null
+                    ? _vrStreamTexture.PlaybackDurationMs
+                    : 0L;
+                _immersiveTimeLabel.text = FormatMediaTime(position) + " / " +
+                                           FormatMediaTime(duration);
+            }
+        }
+
+        private static string FormatMediaTime(long milliseconds)
+        {
+            if (milliseconds <= 0L) return "--:--";
+            long totalSeconds = milliseconds / 1000L;
+            long hours = totalSeconds / 3600L;
+            long minutes = (totalSeconds % 3600L) / 60L;
+            long seconds = totalSeconds % 60L;
+            return hours > 0L
+                ? $"{hours}:{minutes:00}:{seconds:00}"
+                : $"{minutes:00}:{seconds:00}";
+        }
+
+        private void UpdateVrToolbarLabels()
+        {
+            SetButtonLabel(_xrButton, _xrMode ? "?" : "VR");
+            SetButtonLabel(
+                _upButton,
+                _xrMode && _vrPresenter != null
+                    ? _vrPresenter.StereoLabel
+                    : "?");
+            SetButtonLabel(
+                _downButton,
+                _xrMode
+                    ? (_vrPresenter != null &&
+                       _vrPresenter.Mode != XrLabWebVrPresenter.ProjectionMode.Vr180Sbs
+                        ? _vrPresenter.ModeLabel
+                        : "360")
+                    : "?");
+            SetButtonLabel(_keyboardButton, _xrMode ? "?" : "ABC");
+        }
+
+        private static void SetButtonLabel(Button button, string label)
+        {
+            if (button == null) return;
+            TextMeshProUGUI text = button.GetComponentInChildren<TextMeshProUGUI>(true);
+            if (text != null) text.text = label;
         }
 
         public void ProbeFocusedEditable(Vector2Int webPoint)
@@ -2578,10 +3767,110 @@ namespace MLOmega.XR.UI
             return label;
         }
 
+        private void OnDestroy()
+        {
+            PrepareClose();
+        }
+
         private static string Shorten(string value, int max)
         {
             if (string.IsNullOrEmpty(value) || value.Length <= max) return value;
             return value.Substring(0, max - 1) + "…";
+        }
+    }
+
+    /// <summary>
+    /// Immersive Media3 timeline. It reads cached playback metadata (no JNI call
+    /// per frame) and seeks only when the user pinches or drags the thin bar.
+    /// </summary>
+    public sealed class XrLabVrSeekSlider : MonoBehaviour,
+        IPointerDownHandler,
+        IPointerUpHandler,
+        IPointerClickHandler,
+        IDragHandler,
+        IEndDragHandler,
+        IPointerEnterHandler,
+        IPointerExitHandler
+    {
+        private Image _track;
+        private Image _fill;
+        private Func<float> _read;
+        private Action<float> _seek;
+        private float _normalized;
+        private bool _dragging;
+
+        public void Configure(Image fill, Func<float> read, Action<float> seek)
+        {
+            _track = GetComponent<Image>();
+            _fill = fill;
+            _read = read;
+            _seek = seek;
+            Refresh();
+        }
+
+        public void Refresh()
+        {
+            if (!_dragging && _read != null) _normalized = Mathf.Clamp01(_read());
+            UpdateVisual(_dragging);
+        }
+
+        public void OnPointerEnter(PointerEventData eventData) => UpdateVisual(true);
+        public void OnPointerExit(PointerEventData eventData)
+        {
+            if (!_dragging) UpdateVisual(false);
+        }
+        public void OnPointerDown(PointerEventData eventData)
+        {
+            _dragging = true;
+            SetFromPointer(eventData, false);
+        }
+        public void OnDrag(PointerEventData eventData) => SetFromPointer(eventData, false);
+        public void OnPointerUp(PointerEventData eventData)
+        {
+            SetFromPointer(eventData, true);
+            _dragging = false;
+            UpdateVisual(false);
+        }
+        public void OnEndDrag(PointerEventData eventData)
+        {
+            if (_dragging) _seek?.Invoke(_normalized);
+            _dragging = false;
+            UpdateVisual(false);
+        }
+        public void OnPointerClick(PointerEventData eventData) { }
+
+        private void SetFromPointer(PointerEventData eventData, bool commit)
+        {
+            if (!(transform is RectTransform rect) || eventData == null) return;
+            Vector3 local = rect.InverseTransformPoint(
+                eventData.pointerCurrentRaycast.worldPosition);
+            _normalized = Mathf.InverseLerp(
+                rect.rect.xMin + 7f,
+                rect.rect.xMax - 7f,
+                local.x);
+            if (commit) _seek?.Invoke(_normalized);
+            UpdateVisual(true);
+        }
+
+        private void UpdateVisual(bool active)
+        {
+            if (_fill != null && _track != null)
+            {
+                float available = Mathf.Max(4f, _track.rectTransform.rect.width - 14f);
+                float width = Mathf.Max(4f, available * Mathf.Clamp01(_normalized));
+                _fill.rectTransform.anchorMin =
+                    _fill.rectTransform.anchorMax = new Vector2(.5f, .5f);
+                _fill.rectTransform.sizeDelta = new Vector2(width, active ? 12f : 8f);
+                _fill.rectTransform.anchoredPosition =
+                    new Vector2(-available * .5f + width * .5f, 0f);
+                _fill.color = active
+                    ? Color.white
+                    : new Color(.84f, .90f, 1f, .98f);
+            }
+            if (_track != null)
+                _track.color = active
+                    ? new Color(.34f, .37f, .45f, .96f)
+                    : new Color(.24f, .26f, .31f, .86f);
         }
     }
 

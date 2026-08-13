@@ -74,6 +74,33 @@ namespace MLOmega.XR.Reflex
         /// <summary>Raised on the main thread for each recognised gesture.</summary>
         public event Action<GestureEvent> GestureRecognized;
 
+        /// <summary>
+        /// Optional feature-layer interception for the deliberate two-palm
+        /// gesture. This keeps the generic gesture assembly independent from
+        /// Lab/browser types while still providing an emergency immersive exit.
+        /// </summary>
+        public static event Func<bool> TwoPalmOverrideRequested;
+
+        public static bool TryHandleTwoPalmOverride()
+        {
+            Delegate[] handlers = TwoPalmOverrideRequested?.GetInvocationList();
+            if (handlers == null) return false;
+            foreach (Delegate handler in handlers)
+            {
+                try
+                {
+                    if (((Func<bool>)handler).Invoke()) return true;
+                }
+                catch (Exception exception)
+                {
+                    Debug.LogWarning(
+                        "[GestureBridge] two-palm override failed: " +
+                        exception.Message);
+                }
+            }
+            return false;
+        }
+
         /// <summary>Whether the native/simulated pipeline is currently running.</summary>
         public bool IsRunning { get; private set; }
 

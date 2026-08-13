@@ -14,6 +14,8 @@ unity/.vs/
 
 # Proprietary XREAL SDK (download separately)
 unity/Packages/xreal-sdk/
+unity/Assets/Plugins/Android/xreal-private-lens-probe.aar
+unity/Assets/Plugins/Android/xreal-private-lens-probe.aar.meta
 *.tar.gz
 *.tgz
 

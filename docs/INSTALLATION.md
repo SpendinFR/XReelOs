@@ -80,7 +80,8 @@ phone mirroring instead of stereo XR.
    palms, thumb-up quick menu, then window move/resize.
 7. Authorize Shizuku for XReel OS when asked.
 8. Test a non-protected app window first (Chrome/YouTube/Reddit/Spotify), then
-   Netflix or Prime cinema, and finally Moonlight.
+   Netflix or Prime cinema, Moonlight, and finally the internal VR browser with
+   a direct non-DRM VR stream.
 
 ## Installed applications
 
@@ -98,7 +99,17 @@ The current dock recognizes these Android package names:
 
 When an application is not installed, its surface cannot launch. Manufacturer,
 beta or regional variants can expose a different package/activity and may need
-a small adapter contribution.
+a small adapter contribution. Dock artwork is not bundled: XReel OS asks
+Android for the icon of the installed package and displays a fallback glyph if
+that lookup fails.
+
+## Internal VR browser
+
+Open **Navigateur VR** from the dock, browse to a compatible direct-video site,
+start the video and select **VR**. Use AUTO/mono/SBS as needed for the source.
+The immersive view supports head tracking, play/pause and seek; show two open
+palms to return to the spatial browser. Protected Netflix/Prime playback uses
+the separate cinema route and is not a WebVR source.
 
 ## Moonlight outside the home network
 

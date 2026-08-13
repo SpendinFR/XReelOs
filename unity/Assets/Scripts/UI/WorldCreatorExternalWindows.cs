@@ -852,9 +852,8 @@ namespace MLOmega.XR.UI
             state.Rect.GetComponentsInChildren(true, state.HitGraphics);
             RevealExternalWindowAffordances(state, 8f);
             ShowGestureToast(
-                state.CropEditing
-                    ? "CROP // TIRE UN BORD, IMAGE INTACTE"
-                    : "CROP // CADRE MASQUE",
+                "Recadrage",
+                state.CropEditing ? "Activ?" : "Masqu?",
                 new Color(.55f, .90f, 1f));
         }
 

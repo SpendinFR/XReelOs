@@ -111,6 +111,8 @@ namespace MLOmega.XR.UI
         private RectTransform _gestureToastRect;
         private Image _gestureToastPanel;
         private TextMeshProUGUI _gestureToastLabel;
+        private TextMeshProUGUI _gestureToastStateLabel;
+        private Image _gestureToastDot;
         private float _gestureToastShownAt = -1f;
         private float _gestureToastHideAt = -1f;
         private Canvas _settingsDeck;
@@ -317,6 +319,20 @@ namespace MLOmega.XR.UI
             _deckManipulationMode != DeckManipulationMode.None;
 
         public bool IsLabWorkspaceVisible => !_osOnlyMode && !_deckMinimized;
+
+        /// <summary>
+        /// Reveal the dock after a cinema return only when no other spatial
+        /// content remains visible.
+        /// </summary>
+        public void OpenWindowDockIfNoVisibleWindows()
+        {
+            if ((!_osOnlyMode && !_deckMinimized) ||
+                (_settingsDeck != null && _settingsDeck.gameObject.activeSelf) ||
+                (_quickMenu != null && _quickMenu.gameObject.activeSelf) ||
+                HasVisibleExternalSpatialWindows())
+                return;
+            OpenWindowDockFromTwoPalms();
+        }
 
         public float WindowDockDepth => Mathf.Clamp(
             PlayerPrefs.GetFloat(WindowDockDepthPreference, 1.08f), .62f, 2.2f);
@@ -1442,26 +1458,34 @@ namespace MLOmega.XR.UI
         {
             target = null;
             float smallestArea = float.MaxValue;
-            ResolveTargetInGraphics(
-                _deckHitGraphics,
-                worldPoint,
-                ref target,
-                ref smallestArea);
-            ResolveTargetInGraphics(
-                _settingsHitGraphics,
-                worldPoint,
-                ref target,
-                ref smallestArea);
-            ResolveTargetInGraphics(
-                _windowDockHitGraphics,
-                worldPoint,
-                ref target,
-                ref smallestArea);
-            ResolveTargetInGraphics(
-                _quickMenuHitGraphics,
-                worldPoint,
-                ref target,
-                ref smallestArea);
+            // The custom XR resolver works in world coordinates and therefore
+            // cannot rely on CanvasGroup/GraphicRaycaster visibility filtering.
+            // Never let minimized or hidden surfaces keep an invisible click
+            // target (the old PRESET button was the observed offender).
+            if (!_deckMinimized)
+                ResolveTargetInGraphics(
+                    _deckHitGraphics,
+                    worldPoint,
+                    ref target,
+                    ref smallestArea);
+            if (_settingsDeck != null && _settingsDeck.gameObject.activeSelf)
+                ResolveTargetInGraphics(
+                    _settingsHitGraphics,
+                    worldPoint,
+                    ref target,
+                    ref smallestArea);
+            if (_windowDock != null && _windowDock.gameObject.activeSelf)
+                ResolveTargetInGraphics(
+                    _windowDockHitGraphics,
+                    worldPoint,
+                    ref target,
+                    ref smallestArea);
+            if (_quickMenu != null && _quickMenu.gameObject.activeSelf)
+                ResolveTargetInGraphics(
+                    _quickMenuHitGraphics,
+                    worldPoint,
+                    ref target,
+                    ref smallestArea);
             ResolveExternalWindowTargets(
                 worldPoint,
                 ref target,
@@ -1605,16 +1629,19 @@ namespace MLOmega.XR.UI
             SetDeckHandleVisuals(mode, window);
             if (mode == DeckManipulationMode.Depth)
                 ShowGestureToast(
-                    "PROFONDEUR // GAUCHE RAPPROCHE • DROITE ELOIGNE",
-                    new Color(.72f, .36f, 1f));
+                    "Profondeur",
+                    "Activée",
+                    new Color(1f, .64f, .22f));
             else if (mode == DeckManipulationMode.Tilt)
                 ShowGestureToast(
-                    "INCLINAISON // HAUT-BAS + GAUCHE-DROITE",
-                    new Color(.55f, .78f, 1f));
+                    "Inclinaison",
+                    "Activée",
+                    new Color(1f, .64f, .22f));
             else if (mode == DeckManipulationMode.ResizeFree)
                 ShowGestureToast(
-                    "FORMAT LIBRE // GAUCHE-DROITE LARGEUR + HAUT-BAS HAUTEUR",
-                    new Color(.55f, .78f, 1f));
+                    "Format libre",
+                    "Activé",
+                    new Color(1f, .64f, .22f));
             return true;
         }
 
@@ -4677,41 +4704,68 @@ namespace MLOmega.XR.UI
             _gestureToastGroup.interactable = false;
             _gestureToastGroup.blocksRaycasts = false;
             _gestureToastRect = go.GetComponent<RectTransform>();
-            _gestureToastRect.sizeDelta = new Vector2(360f, 44f);
+            _gestureToastRect.sizeDelta = new Vector2(246f, 62f);
             _gestureToastRect.localScale = Vector3.one * .00066f;
             Image rim = MakeImage(
                 _gestureToastRect,
                 "Vision notification fine rim",
                 Vector2.zero,
-                new Vector2(364f, 48f),
-                new Color(.88f, .91f, .98f, .10f));
+                new Vector2(250f, 66f),
+                new Color(.94f, .95f, 1f, .11f));
             rim.raycastTarget = false;
             _gestureToastPanel = MakeImage(
                 _gestureToastRect,
                 "Vision notification glass",
                 Vector2.zero,
                 _gestureToastRect.sizeDelta,
-                new Color(.025f, .030f, .040f, .74f));
+                new Color(.018f, .020f, .027f, .90f));
             _gestureToastPanel.raycastTarget = false;
             _gestureToastLabel = MakeText(
                 _gestureToastPanel.transform,
                 string.Empty,
-                Vector2.zero,
-                new Vector2(334f, 36f),
-                13.5f,
+                new Vector2(-12f, 12f),
+                new Vector2(190f, 19f),
+                11.5f,
                 VisionText,
+                FontStyles.Normal);
+            _gestureToastLabel.alignment = TextAlignmentOptions.Left;
+            _gestureToastLabel.enableWordWrapping = false;
+            _gestureToastLabel.overflowMode = TextOverflowModes.Ellipsis;
+            _gestureToastStateLabel = MakeText(
+                _gestureToastPanel.transform,
+                string.Empty,
+                new Vector2(-12f, -11f),
+                new Vector2(190f, 21f),
+                12.5f,
+                new Color(1f, .64f, .22f),
                 FontStyles.Bold);
-            _gestureToastLabel.alignment = TextAlignmentOptions.Center;
+            _gestureToastStateLabel.alignment = TextAlignmentOptions.Left;
+            _gestureToastStateLabel.enableWordWrapping = false;
+            _gestureToastStateLabel.overflowMode = TextOverflowModes.Ellipsis;
+            _gestureToastDot = MakeImage(
+                _gestureToastPanel.transform,
+                "Vision notification status dot",
+                new Vector2(104f, -11f),
+                new Vector2(8f, 8f),
+                new Color(1f, .64f, .22f));
+            _gestureToastDot.raycastTarget = false;
             _gestureToastGroup.alpha = 0f;
             go.SetActive(false);
         }
 
         private void ShowGestureToast(string text, Color color)
         {
+            SplitGestureToast(text, out string title, out string state);
+            ShowGestureToast(title, state, color);
+        }
+
+        private void ShowGestureToast(string title, string state, Color color)
+        {
             if (_gestureToastCanvas == null) BuildGestureToast();
             if (
                 _gestureToastCanvas == null ||
                 _gestureToastLabel == null ||
+                _gestureToastStateLabel == null ||
                 _camera == null)
                 return;
             Vector3 forward = _camera.transform.forward.normalized;
@@ -4723,13 +4777,134 @@ namespace MLOmega.XR.UI
                 forward * .88f +
                 _camera.transform.up * .04f,
                 Quaternion.LookRotation(forward, up));
-            _gestureToastLabel.text = text;
-            _gestureToastLabel.color = Color.Lerp(VisionText, color, .28f);
+            _gestureToastLabel.text = title;
+            _gestureToastLabel.color = new Color(.94f, .95f, .98f, .98f);
+            _gestureToastStateLabel.text = state;
+            Color accent = Color.Lerp(
+                new Color(1f, .64f, .22f, 1f),
+                new Color(color.r, color.g, color.b, 1f),
+                .28f);
+            _gestureToastStateLabel.color = accent;
+            if (_gestureToastDot != null) _gestureToastDot.color = accent;
             _gestureToastCanvas.gameObject.SetActive(true);
             _gestureToastShownAt = Time.unscaledTime;
             _gestureToastHideAt = Time.unscaledTime + 1.65f;
             _gestureToastRect.localScale = Vector3.one * .00062f;
             if (_gestureToastGroup != null) _gestureToastGroup.alpha = 0f;
+        }
+
+        private static void SplitGestureToast(
+            string raw,
+            out string title,
+            out string state)
+        {
+            string text = NormalizeGestureToast(raw);
+            int split = text.IndexOf("//", StringComparison.Ordinal);
+            int separatorLength = 2;
+            if (split < 0)
+            {
+                split = text.IndexOf('•');
+                separatorLength = 1;
+            }
+            if (split >= 0)
+            {
+                title = text.Substring(0, split).Trim();
+                state = text.Substring(split + separatorLength).Trim();
+            }
+            else
+            {
+                title = text.Trim();
+                state = InferGestureToastState(ref title);
+            }
+
+            title = GestureToastSentenceCase(title);
+            state = GestureToastSentenceCase(
+                string.IsNullOrWhiteSpace(state) ? "Confirmé" : state);
+        }
+
+        private static string InferGestureToastState(ref string title)
+        {
+            string upper = title.ToUpperInvariant();
+            if (upper.Contains("REFUS"))
+            {
+                RemoveGestureToastStatus(ref title, "refusé", "refuse");
+                return "Refusé";
+            }
+            if (upper.Contains("FERM"))
+            {
+                RemoveGestureToastStatus(
+                    ref title, "fermées", "fermée", "fermé", "ferme");
+                return "Fermé";
+            }
+            if (upper.Contains("COUP"))
+            {
+                RemoveGestureToastStatus(ref title, "coupé", "coupe");
+                return "Désactivé";
+            }
+            if (upper.Contains("PRÊT") || upper.Contains("PRET"))
+            {
+                RemoveGestureToastStatus(ref title, "prêtes", "prête", "prêt", "pret");
+                return "Prêt";
+            }
+            if (upper.Contains("MODIFI"))
+            {
+                RemoveGestureToastStatus(
+                    ref title, "modifiées", "modifiée", "modifié", "modifie");
+                return "Modifié";
+            }
+            if (upper.Contains("RECENTR"))
+            {
+                RemoveGestureToastStatus(
+                    ref title, "recentrées", "recentrée", "recentré", "recentre");
+                return "Recentré";
+            }
+            if (upper.Contains("ACTIF") || upper.Contains("ACTIVE"))
+            {
+                RemoveGestureToastStatus(
+                    ref title, "actives", "active", "actifs", "actif");
+                return "Activé";
+            }
+            if (upper.Contains("VEILLE")) return "En veille";
+            return "Confirmé";
+        }
+
+        private static void RemoveGestureToastStatus(
+            ref string title,
+            params string[] tokens)
+        {
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                int index = title.IndexOf(
+                    tokens[i], StringComparison.OrdinalIgnoreCase);
+                if (index < 0) continue;
+                title = title.Remove(index, tokens[i].Length)
+                    .Trim(' ', '-', '/', '•');
+                return;
+            }
+        }
+
+        private static string NormalizeGestureToast(string value) =>
+            (value ?? string.Empty)
+                .Replace("â€¢", "•")
+                .Replace("Ã‰", "É")
+                .Replace("Ãˆ", "È")
+                .Replace("ÃŠ", "Ê")
+                .Replace("Ã©", "é")
+                .Replace("Ã¨", "è")
+                .Replace("Ãª", "ê");
+
+        private static string GestureToastSentenceCase(string value)
+        {
+            string trimmed = (value ?? string.Empty).Trim();
+            if (trimmed.Length == 0) return string.Empty;
+            string result = char.ToUpperInvariant(trimmed[0]) +
+                            trimmed.Substring(1).ToLowerInvariant();
+            return result
+                .Replace("Vr", "VR")
+                .Replace("Xreal", "XREAL")
+                .Replace("Ui", "UI")
+                .Replace("Fps", "FPS")
+                .Replace("6dof", "6DoF");
         }
 
         private void UpdateGestureToast()

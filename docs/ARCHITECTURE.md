@@ -13,7 +13,9 @@ XREAL One Pro + Eye
        -> dock / settings / quick menu / window blocks
        -> WorldCreatorLabShell
             -> Android spatial app hosts
-            -> XR keyboard
+            -> internal browser + XR keyboard
+            -> raw media discovery / Android external texture
+            -> Unity VR180/VR360 presenter
             -> protected cinema handoff
             -> Moonlight 3D / 2D handoff
 ```
@@ -49,6 +51,31 @@ system-mirror/cinema transition because Widevine/secure surfaces cannot be
 sampled into an ordinary Unity texture. The in-cinema dock remains a small system
 surface, then XREAL's 3D activity is relaunched once and MediaPipe is restarted.
 
+The shell never republishes third-party app icons. `XrLabAndroidIconLoader`
+asks Android's `PackageManager` for the icon of an installed package and turns
+that drawable into a transient Unity sprite; the dock falls back to a local
+glyph if the package or icon is unavailable.
+
+## Immersive web video
+
+The VR browser has a separate pipeline from the protected cinema bridge:
+
+```text
+TLabWebView page
+  -> JavaScript media probe and raw URL/blob discovery
+  -> XrWebVrBridge (Android Media3 player)
+  -> SurfaceTexture / external OES texture
+  -> XrLabWebVrStreamTexture
+  -> XrLabWebVrPresenter + XrLabWebVr.shader
+  -> mono, SBS, VR180 or VR360 per-eye rendering
+```
+
+Keeping the decoder surface in Android and importing its external texture
+avoids a CPU readback/copy per frame. The presenter owns head-tracked projection,
+layout selection, seek/play/pause and the two-palm exit gesture. It deliberately
+does not bypass DRM: protected Netflix/Prime playback remains in the system
+cinema path.
+
 ## Rendering contract
 
 The hardware-proven XREAL template contract is retained:
@@ -61,6 +88,11 @@ The hardware-proven XREAL template contract is retained:
 - runtime shaders explicitly included rather than discovered only by
   `Shader.Find`;
 - DeX must not own the external display.
+
+The build postprocessor injects the Java VR bridge and Media3 dependencies only
+for isolated Lab packages and `com.spendinfr.xreelos`. This package gate is a
+release invariant: a build that lacks `XrWebVrBridge` can show the browser but
+cannot enter native immersive playback.
 
 ## Privacy boundary
 

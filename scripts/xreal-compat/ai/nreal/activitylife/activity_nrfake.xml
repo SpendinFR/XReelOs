@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  XREAL's stock SDK layout uses @android:drawable/screen_background_dark.
+  On Samsung One UI/DeX that system drawable is purple. Because the optical
+  display adds emitted light to the real world, the correct passthrough clear
+  is opaque RGB black: it emits nothing and therefore looks transparent.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF000000" />

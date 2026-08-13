@@ -6,6 +6,7 @@
 - Unity 6000.0.23f1 with Android Build Support;
 - Android SDK/build tools and NDK installed through Unity or Android Studio;
 - JDK 17;
+- Gradle 8.7 on `PATH` when rebuilding `mlomega-reflexvision.aar`;
 - XREAL SDK for Unity 3.1.0;
 - Git LFS for release APKs.
 
@@ -36,6 +37,8 @@ the original project's speech, KWS, VAD or ONNX models.
 ## Command-line build
 
 ```powershell
+.\scripts\BUILD_XREAL_LENS_PROBE_AAR.ps1 `
+  -PrivateLibrary "C:\path\to\matching\libnr_service.so"
 .\scripts\BUILD_HAND_PLUGIN.ps1
 .\scripts\BUILD_XREEL_OS.ps1
 ```
@@ -45,9 +48,26 @@ exports a hand-only `mlomega-reflexvision.aar`. Its release AAR contains only
 the app launcher, MediaPipe gesture pipelines, state machine and throttle; no
 ASR, ONNX, translation or audio service is compiled.
 
+`BUILD_XREAL_LENS_PROBE_AAR.ps1` compiles the checked-in Java lens bridge and
+packages a developer-supplied `libnr_service.so` from the matching licensed
+ControlGlasses distribution. The resulting
+`Assets/Plugins/Android/xreal-private-lens-probe.aar` is intentionally ignored
+by Git, just like the proprietary XREAL SDK archive.
+
+`BUILD_XREEL_OS.ps1` deliberately runs Unity twice. Pass 1 imports the local
+XREAL/AR Foundation packages and sets `XREAL_SDK_PRESENT`; pass 2 compiles and
+packages the real XREAL adapter. It then copies the verified artifact to
+`releases/XReelOs.apk` and regenerates `releases/SHA256SUMS.txt`.
+
 Equivalent Unity invocation:
 
 ```powershell
+& "C:\Program Files\Unity\Hub\Editor\6000.0.23f1\Editor\Unity.exe" `
+  -batchmode -nographics -quit -buildTarget Android `
+  -projectPath "$PWD\unity" `
+  -executeMethod MLOmega.XR.Editor.AndroidBuildXreal.PrepareDefines `
+  -logFile "$PWD\unity\xreelos-prepare.log"
+
 & "C:\Program Files\Unity\Hub\Editor\6000.0.23f1\Editor\Unity.exe" `
   -batchmode -nographics -quit -buildTarget Android `
   -projectPath "$PWD\unity" `
@@ -78,6 +98,11 @@ entry:   ai.nreal.activitylife.NRXRActivity
 - transparent optical background is enabled;
 - only one XREAL 3D relaunch occurs after a cinema/desktop handoff;
 - WebView is enabled for the OS build without adding audio/ONNX runtimes;
+- the generated player contains `XrWebVrBridge`, Media3 HLS support and the
+  `XrLabWebVr` shader;
+- the XReel launcher icon is imported from `Assets/Brand/XReelOsIcon.png`;
+- `scripts/xreal-compat` resolves inside this repository, never from a private
+  parent checkout;
 - the app package remains independent from every private product package.
 
 ## Release verification
@@ -86,7 +111,7 @@ entry:   ai.nreal.activitylife.NRXRActivity
 $apk = ".\unity\build\android\XReelOs.apk"
 $analyzer = "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\apkanalyzer.bat"
 & $analyzer manifest application-id $apk
-& $analyzer files list $apk | Select-String "hand_landmarker|onnx|sherpa|webrtc"
+& $analyzer files list $apk | Select-String "hand_landmarker|onnx|sherpa|webrtc|XrWebVr"
 Get-FileHash $apk -Algorithm SHA256
 ```
 
@@ -109,6 +134,12 @@ On S24 + One Pro + Eye:
 8. no `NativeRGBCamera Start Failure` after return;
 9. no microphone audio in first-person recording;
 10. clean launch after DeX preflight and Shizuku restart.
+11. internal browser enters/exits a direct VR180/SBS stream, with head tracking,
+    pause/play and seek controls, then returns to a usable spatial browser.
 
 The baseline from which the community build was extracted passed the critical
 Moonlight 2D -> XREAL 3D -> MediaPipe restart gate on 11 August 2026.
+
+The complete chronology, renderer diagnostics, Samsung external-display
+recovery and VR-specific release gates are in
+[BUILD_GUIDE_XREAL.md](BUILD_GUIDE_XREAL.md).

@@ -1,0 +1,1348 @@
+package com.mlomega.xr.webvr;
+
+import android.app.Activity;
+import android.app.Presentation;
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.SurfaceTexture;
+import android.hardware.display.DisplayManager;
+import android.net.Uri;
+import android.net.http.SslError;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
+import android.opengl.Matrix;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.util.DisplayMetrics;
+import android.view.Display;
+import android.view.Surface;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
+import android.webkit.CookieManager;
+import android.webkit.HttpAuthHandler;
+import android.webkit.SslErrorHandler;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+
+import androidx.annotation.Nullable;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+
+import com.tlab.webkit.BaseOffscreenFragment;
+import com.tlab.webkit.chromium.OffscreenBrowser;
+
+import org.json.JSONObject;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.ShortBuffer;
+import java.util.Iterator;
+import java.util.Locale;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+/**
+ * Isolated Web-VR bridge for the v15 experiment.
+ *
+ * The normal TLab WebView remains the owner of navigation, login and cookies.
+ * This wrapper observes (never consumes) media requests, then hands the selected
+ * stream and its ephemeral request context to Media3. Authentication material is
+ * kept in memory only and is never included in logs or status strings.
+ */
+@UnstableApi
+public final class XrWebVrBridge {
+    private static final String TAG = "MLOmegaWebVR";
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final WeakHashMap<WebView, CaptureState> CAPTURES =
+            new WeakHashMap<>();
+
+    private static Presentation presentation;
+    private static GLSurfaceView glView;
+    private static VrRenderer renderer;
+    private static ExoPlayer player;
+    private static Surface videoSurface;
+    private static SurfaceTexture videoTexture;
+    private static UnityVideoCapture unityCapture;
+    private static android.widget.Button phoneExitButton;
+    private static volatile boolean active;
+    private static volatile String status = "idle";
+
+    private XrWebVrBridge() {}
+
+    public static void install(WebView view) {
+        if (view == null) return;
+        Runnable action = () -> {
+            try {
+                synchronized (CAPTURES) {
+                    CaptureState existing = CAPTURES.get(view);
+                    if (existing != null && view.getWebViewClient() == existing.wrapper) {
+                        Log.i(TAG, "authenticated media observer already installed");
+                        return;
+                    }
+                    WebViewClient delegate = view.getWebViewClient();
+                    CaptureState state = new CaptureState(view, delegate);
+                    CAPTURES.put(view, state);
+                    view.setWebViewClient(state.wrapper);
+                    Log.i(TAG, "authenticated media observer installed");
+                }
+            } catch (Throwable error) {
+                Log.e(TAG, "observer installation failed: " +
+                        error.getClass().getSimpleName());
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else MAIN.post(action);
+    }
+
+    /** Returns an in-memory JSON handoff. Callers must not log this value. */
+    public static String getLastStreamJson(WebView view) {
+        if (view == null) return "";
+        synchronized (CAPTURES) {
+            CaptureState state = CAPTURES.get(view);
+            Candidate c = state == null ? null : state.currentCandidate();
+            if (c == null) return "";
+            try {
+                JSONObject root = new JSONObject();
+                root.put("url", c.url);
+                // getLastStreamJson is invoked from Unity's main thread, not
+                // Android's UI thread. Never call WebView methods here: Android
+                // rejects getUrl/getSettings off the UI thread. Page context is
+                // snapshotted by the WebViewClient callbacks instead.
+                root.put("pageUrl", safe(state.pageUrl));
+                root.put("userAgent", safe(state.userAgent));
+                root.put("cookie", safe(c.cookie));
+                root.put("mimeType", safe(c.mimeType));
+                JSONObject headers = new JSONObject();
+                for (Map.Entry<String, String> entry : c.headers.entrySet()) {
+                    String key = entry.getKey();
+                    if (key == null || key.equalsIgnoreCase("Range")) continue;
+                    headers.put(key, safe(entry.getValue()));
+                }
+                root.put("headers", headers);
+                root.put("kind", c.kind);
+                return root.toString();
+            } catch (Throwable error) {
+                Log.w(TAG, "media handoff serialization failed: " +
+                        error.getClass().getSimpleName());
+                return "";
+            }
+        }
+    }
+
+    /**
+     * Rejects the candidate that Media3 proved to be a thumbnail/preview and
+     * exposes the next best recently observed stream. The URL stays in memory
+     * only and is ignored until the next page navigation.
+     */
+    public static boolean rejectLastStream(WebView view) {
+        if (view == null) return false;
+        synchronized (CAPTURES) {
+            CaptureState state = CAPTURES.get(view);
+            return state != null && state.rejectCurrentCandidate();
+        }
+    }
+
+    public static boolean start(
+            Activity activity,
+            String descriptorJson,
+            int angleDegrees,
+            String stereoMode) {
+        if (activity == null || descriptorJson == null || descriptorJson.isEmpty())
+            return false;
+        final StreamDescriptor descriptor;
+        try {
+            descriptor = StreamDescriptor.parse(descriptorJson);
+        } catch (Throwable error) {
+            status = "invalid media handoff";
+            return false;
+        }
+        if (descriptor.url.isEmpty()) return false;
+        MAIN.post(() -> startOnUi(
+                activity,
+                descriptor,
+                clampAngle(angleDegrees),
+                normalizeStereo(stereoMode)));
+        return true;
+    }
+
+    /**
+     * Starts the authenticated decoder on TLab's HardwareBuffer-backed surface.
+     * The returned fragment is consumed by TLab's existing Unity render-thread
+     * plug-in, so the decoded GL texture stays inside Unity/XREAL's stereo
+     * swapchain instead of opening an Android Presentation.
+     */
+    public static UnityVideoCapture startUnityTexture(
+            Activity activity,
+            String descriptorJson,
+            int textureWidth,
+            int textureHeight,
+            int fps,
+            String stereoMode) {
+        if (activity == null || descriptorJson == null || descriptorJson.isEmpty())
+            return null;
+        final StreamDescriptor descriptor;
+        try {
+            descriptor = StreamDescriptor.parse(descriptorJson);
+        } catch (Throwable error) {
+            status = "invalid media handoff";
+            return null;
+        }
+        if (descriptor.url.isEmpty()) return null;
+
+        final UnityVideoCapture capture = new UnityVideoCapture();
+        MAIN.post(() -> {
+            stopOnUi();
+            unityCapture = capture;
+            active = true;
+            status = "opening authenticated Unity texture";
+            capture.initialize(
+                    activity,
+                    descriptor,
+                    Math.max(1920, textureWidth),
+                    Math.max(1080, textureHeight),
+                    Math.max(24, Math.min(60, fps)),
+                    normalizeStereo(stereoMode));
+        });
+        return capture;
+    }
+
+    // Unity's AndroidJavaObject resolver is unreliable for public methods on
+    // this nested Fragment class on Android 16. Keep all playback controls on
+    // the stable top-level bridge instead.
+    public static long getUnityPlaybackPositionMs() {
+        UnityVideoCapture capture = unityCapture;
+        return capture == null ? 0L : capture.getPlaybackPositionMs();
+    }
+
+    public static long getUnityPlaybackDurationMs() {
+        UnityVideoCapture capture = unityCapture;
+        return capture == null ? 0L : capture.getPlaybackDurationMs();
+    }
+
+    public static boolean seekUnityPlaybackToFraction(float normalized) {
+        UnityVideoCapture capture = unityCapture;
+        if (capture == null) return false;
+        capture.seekToFraction(normalized);
+        return true;
+    }
+
+    public static boolean toggleUnityPlayback() {
+        UnityVideoCapture capture = unityCapture;
+        if (capture == null) return false;
+        capture.togglePlayback();
+        return true;
+    }
+
+    public static boolean isUnityPlaybackPlaying() {
+        UnityVideoCapture capture = unityCapture;
+        return capture != null && capture.isPlaybackPlaying();
+    }
+
+    private static void startOnUi(
+            Activity activity,
+            StreamDescriptor descriptor,
+            int angleDegrees,
+            String stereoMode) {
+        stopOnUi();
+        try {
+            Display display = findExternalDisplay(activity);
+            if (display == null) {
+                status = "XREAL display unavailable";
+                Log.w(TAG, status);
+                return;
+            }
+
+            renderer = new VrRenderer(texture -> MAIN.post(() -> {
+                if (!active || renderer == null) return;
+                videoTexture = texture;
+                videoSurface = new Surface(texture);
+                startPlayer(activity, descriptor, videoSurface);
+            }));
+            renderer.configure(angleDegrees, stereoMode);
+
+            glView = new GLSurfaceView(activity);
+            glView.setEGLContextClientVersion(2);
+            glView.setPreserveEGLContextOnPause(true);
+            glView.setRenderer(renderer);
+            glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+            glView.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_FULLSCREEN |
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+
+            presentation = new Presentation(activity, display);
+            Window window = presentation.getWindow();
+            if (window != null) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                window.setDimAmount(0f);
+            }
+            presentation.setContentView(glView);
+            presentation.setOnDismissListener(dialog -> {
+                if (active) stopOnUi();
+            });
+            active = true;
+            status = "opening authenticated stream";
+            presentation.show();
+            showPhoneExitButton(activity);
+            Log.i(TAG, "VR presentation started on external display " +
+                    display.getDisplayId() + " at " + angleDegrees + " degrees/" +
+                    stereoMode);
+        } catch (Throwable error) {
+            status = "VR presentation failed: " + error.getClass().getSimpleName();
+            Log.e(TAG, status);
+            stopOnUi();
+        }
+    }
+
+    private static void startPlayer(
+            Activity activity,
+            StreamDescriptor descriptor,
+            Surface surface) {
+        try {
+            DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
+                    .setAllowCrossProtocolRedirects(true)
+                    .setConnectTimeoutMs(15000)
+                    .setReadTimeoutMs(20000);
+            if (!descriptor.userAgent.isEmpty()) http.setUserAgent(descriptor.userAgent);
+            if (!descriptor.headers.isEmpty())
+                http.setDefaultRequestProperties(descriptor.headers);
+
+            DefaultMediaSourceFactory mediaSources = new DefaultMediaSourceFactory(http);
+            player = new ExoPlayer.Builder(activity)
+                    .setMediaSourceFactory(mediaSources)
+                    .build();
+            player.setVideoSurface(surface);
+            player.addListener(new Player.Listener() {
+                @Override
+                public void onTracksChanged(androidx.media3.common.Tracks tracks) {
+                    VrRenderer target = renderer;
+                    UnityVideoCapture unityTarget = unityCapture;
+                    if ((target == null || !target.isAutoStereo()) &&
+                            (unityTarget == null || !unityTarget.isAutoStereo())) return;
+                    for (androidx.media3.common.Tracks.Group group : tracks.getGroups()) {
+                        for (int index = 0; index < group.length; index++) {
+                            if (!group.isTrackSelected(index)) continue;
+                            androidx.media3.common.Format format =
+                                    group.getTrackFormat(index);
+                            String detected = stereoFromMedia3(format.stereoMode);
+                            if (!detected.isEmpty()) {
+                                if (target != null) target.setDetectedStereo(detected);
+                                if (unityTarget != null)
+                                    unityTarget.setDetectedStereo(detected);
+                                Log.i(TAG, "Media3 stereo metadata=" + detected);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                @Override
+                public void onVideoSizeChanged(androidx.media3.common.VideoSize videoSize) {
+                    VrRenderer target = renderer;
+                    UnityVideoCapture unityTarget = unityCapture;
+                    if (target != null)
+                        target.detectProjection(videoSize.width, videoSize.height);
+                    if (unityTarget != null)
+                        unityTarget.onVideoSize(videoSize.width, videoSize.height);
+                    Log.i(TAG, "decoded video=" + videoSize.width + "x" +
+                            videoSize.height + " stereo=" +
+                            (target != null
+                                    ? target.activeStereo()
+                                    : unityTarget != null
+                                            ? unityTarget.activeStereo()
+                                            : "unavailable") +
+                            " projection=" +
+                            (target != null
+                                    ? target.activeAngle()
+                                    : unityTarget != null
+                                            ? unityTarget.activeAngle()
+                                            : "unavailable"));
+                    if (videoSize.width < 960 || videoSize.height < 540) {
+                        failAndDismiss("preview stream rejected " + videoSize.width +
+                                "x" + videoSize.height);
+                    }
+                }
+
+                @Override
+                public void onPlaybackStateChanged(int playbackState) {
+                    if (playbackState == Player.STATE_READY) {
+                        status = "playing";
+                        Log.i(TAG, "authenticated VR stream ready");
+                    } else if (playbackState == Player.STATE_BUFFERING) {
+                        status = "buffering";
+                    } else if (playbackState == Player.STATE_ENDED) {
+                        status = "ended";
+                    }
+                }
+
+                @Override
+                public void onPlayerError(PlaybackException error) {
+                    final String failure = "playback error " + error.errorCode;
+                    failAndDismiss(failure);
+                }
+            });
+            MediaItem.Builder item = new MediaItem.Builder().setUri(descriptor.url);
+            if (!descriptor.mimeType.isEmpty()) item.setMimeType(descriptor.mimeType);
+            player.setMediaItem(item.build());
+            player.prepare();
+            player.setPlayWhenReady(true);
+        } catch (Throwable error) {
+            failAndDismiss("decoder failed: " + error.getClass().getSimpleName());
+        }
+    }
+
+    private static void failAndDismiss(String failure) {
+        status = failure;
+        Log.e(TAG, failure + " (URL and credentials redacted)");
+        // Never strand the user behind an empty native Presentation. Unity
+        // observes active=false and restores the spatial browser automatically.
+        MAIN.post(() -> {
+            stopOnUi();
+            status = failure;
+        });
+    }
+
+    private static void showPhoneExitButton(Activity activity) {
+        removePhoneExitButton();
+        try {
+            android.widget.Button button = new android.widget.Button(activity);
+            button.setText("Retour MLOmega");
+            button.setTextSize(15f);
+            button.setAllCaps(false);
+            button.setOnClickListener(view -> stopOnUi());
+            android.widget.FrameLayout.LayoutParams params =
+                    new android.widget.FrameLayout.LayoutParams(
+                            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+                            android.view.Gravity.BOTTOM | android.view.Gravity.CENTER_HORIZONTAL);
+            params.bottomMargin = 64;
+            activity.addContentView(button, params);
+            phoneExitButton = button;
+        } catch (Throwable error) {
+            Log.w(TAG, "phone VR exit control unavailable: " +
+                    error.getClass().getSimpleName());
+        }
+    }
+
+    private static void removePhoneExitButton() {
+        android.widget.Button button = phoneExitButton;
+        phoneExitButton = null;
+        if (button == null) return;
+        try {
+            android.view.ViewParent parent = button.getParent();
+            if (parent instanceof android.view.ViewGroup)
+                ((android.view.ViewGroup)parent).removeView(button);
+        } catch (Throwable ignored) { }
+    }
+
+    private static String stereoFromMedia3(int value) {
+        if (value == androidx.media3.common.C.STEREO_MODE_LEFT_RIGHT) return "sbs";
+        if (value == androidx.media3.common.C.STEREO_MODE_TOP_BOTTOM) return "tb";
+        if (value == androidx.media3.common.C.STEREO_MODE_MONO) return "mono";
+        return "";
+    }
+
+    public static void setHeadPose(float yawDegrees, float pitchDegrees) {
+        VrRenderer target = renderer;
+        if (target != null) target.setHeadPose(yawDegrees, pitchDegrees);
+    }
+
+    public static void recenter() {
+        VrRenderer target = renderer;
+        if (target != null) target.recenter();
+    }
+
+    public static void configure(int angleDegrees, String stereoMode) {
+        VrRenderer target = renderer;
+        if (target != null) target.configure(
+                clampAngle(angleDegrees), normalizeStereo(stereoMode));
+    }
+
+    public static boolean isActive() { return active; }
+
+    public static String getStatus() { return status; }
+
+    public static void stop() {
+        if (Looper.myLooper() == Looper.getMainLooper()) stopOnUi();
+        else MAIN.post(XrWebVrBridge::stopOnUi);
+    }
+
+    /** Stops Media3 while leaving shared-texture disposal to Unity's render thread. */
+    public static void stopUnityPlayback() {
+        Runnable action = () -> {
+            active = false;
+            ExoPlayer oldPlayer = player;
+            player = null;
+            if (oldPlayer != null) {
+                try { oldPlayer.clearVideoSurface(); } catch (Throwable ignored) {}
+                try { oldPlayer.release(); } catch (Throwable ignored) {}
+            }
+            unityCapture = null;
+            status = "idle";
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else MAIN.post(action);
+    }
+
+    private static void stopOnUi() {
+        active = false;
+        removePhoneExitButton();
+        ExoPlayer oldPlayer = player;
+        player = null;
+        if (oldPlayer != null) {
+            try { oldPlayer.clearVideoSurface(); } catch (Throwable ignored) {}
+            try { oldPlayer.release(); } catch (Throwable ignored) {}
+        }
+        Surface oldSurface = videoSurface;
+        videoSurface = null;
+        if (oldSurface != null) {
+            try { oldSurface.release(); } catch (Throwable ignored) {}
+        }
+        SurfaceTexture oldTexture = videoTexture;
+        videoTexture = null;
+        if (oldTexture != null) {
+            try { oldTexture.release(); } catch (Throwable ignored) {}
+        }
+        Presentation oldPresentation = presentation;
+        presentation = null;
+        if (oldPresentation != null && oldPresentation.isShowing()) {
+            try {
+                oldPresentation.setOnDismissListener(null);
+                oldPresentation.dismiss();
+            } catch (Throwable ignored) {}
+        }
+        if (glView != null) {
+            try { glView.onPause(); } catch (Throwable ignored) {}
+        }
+        glView = null;
+        renderer = null;
+        // Unity owns the shared-texture fragment reference. It must release the
+        // GL resources from its render thread before the Java object can be
+        // collected. Clearing the static owner here is safe; disposing the
+        // fragment here is not (it races queued GL.IssuePluginEvent callbacks).
+        unityCapture = null;
+        status = "idle";
+    }
+
+    /**
+     * Offscreen Media3 decoder surface backed by the exact same TLab shared
+     * texture bridge as the spatial browser. No Android window is presented on
+     * the glasses: Unity remains the only XR compositor.
+     */
+    public static final class UnityVideoCapture extends OffscreenBrowser {
+        private Activity owner;
+        private StreamDescriptor descriptor;
+        private boolean disposed;
+        private boolean disposeScheduled;
+        private boolean playerStarted;
+        private String requestedStereo = "auto";
+        private String detectedStereo = "";
+        private volatile int videoWidth;
+        private volatile int videoHeight;
+        private volatile long playbackPositionMs;
+        private volatile long playbackDurationMs;
+        private volatile boolean playbackPlaying = true;
+        private boolean progressPolling;
+        private final Runnable progressPoll = new Runnable() {
+            @Override
+            public void run() {
+                if (!progressPolling || disposed || unityCapture != UnityVideoCapture.this)
+                    return;
+                ExoPlayer current = player;
+                if (current != null) {
+                    try {
+                        playbackPositionMs = Math.max(0L, current.getCurrentPosition());
+                        long duration = current.getDuration();
+                        playbackDurationMs = duration > 0L ? duration : 0L;
+                        playbackPlaying = current.isPlaying();
+                    } catch (Throwable ignored) { }
+                }
+                MAIN.postDelayed(this, 250L);
+            }
+        };
+
+        public UnityVideoCapture() { super(); }
+
+        void initialize(
+                Activity activity,
+                StreamDescriptor stream,
+                int textureWidth,
+                int textureHeight,
+                int fps,
+                String stereoMode) {
+            owner = activity;
+            descriptor = stream;
+            requestedStereo = normalizeStereo(stereoMode);
+            setRetainInstance(true);
+            try {
+                activity.getFragmentManager()
+                        .beginTransaction()
+                        .add(0, this)
+                        .commitAllowingStateLoss();
+
+                DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
+                initParam(
+                        textureWidth,
+                        textureHeight,
+                        textureWidth,
+                        textureHeight,
+                        Math.max(1, metrics.widthPixels),
+                        Math.max(1, metrics.heightPixels),
+                        false,
+                        BaseOffscreenFragment.CaptureMode.HardwareBuffer);
+                SetFps(fps);
+                init();
+                awaitDecoderSurface(0);
+                Log.i(TAG, "Unity texture capture requested " + textureWidth + "x" +
+                        textureHeight + " @" + fps + "fps");
+            } catch (Throwable error) {
+                failAndDismiss("Unity texture capture failed: " +
+                        error.getClass().getSimpleName());
+            }
+        }
+
+        private void awaitDecoderSurface(int attempt) {
+            if (disposed || unityCapture != this) return;
+            try {
+                Surface surface = mViewToBufferRenderer == null
+                        ? null : mViewToBufferRenderer.getSurface();
+                if (surface != null && surface.isValid()) {
+                    if (!playerStarted) {
+                        // FragmentCapture waits on this exact field before it
+                        // starts issuing render-thread texture updates. The
+                        // normal TLab browser sets it after its view setup; this
+                        // decoder-only fragment has no WebView, so the decoder
+                        // surface being valid is its corresponding ready point.
+                        mInitialized = true;
+                        playerStarted = true;
+                        startPlayer(owner, descriptor, surface);
+                        startProgressPolling();
+                        Log.i(TAG, "Media3 attached to Unity shared texture surface");
+                    }
+                    return;
+                }
+            } catch (Throwable error) {
+                Log.w(TAG, "Unity decoder surface pending: " +
+                        error.getClass().getSimpleName());
+            }
+            if (attempt >= 600) {
+                failAndDismiss("Unity decoder surface timeout");
+                return;
+            }
+            MAIN.postDelayed(() -> awaitDecoderSurface(attempt + 1), 16L);
+        }
+
+        void onVideoSize(int width, int height) {
+            videoWidth = width;
+            videoHeight = height;
+        }
+
+        public int getVideoWidth() { return videoWidth; }
+        public int getVideoHeight() { return videoHeight; }
+        public long getPlaybackPositionMs() { return playbackPositionMs; }
+        public long getPlaybackDurationMs() { return playbackDurationMs; }
+        public void seekToFraction(float normalized) {
+            final float target = Math.max(0f, Math.min(1f, normalized));
+            MAIN.post(() -> {
+                ExoPlayer current = player;
+                if (current == null) return;
+                try {
+                    long duration = current.getDuration();
+                    if (duration > 0L) current.seekTo((long)(duration * target));
+                } catch (Throwable error) {
+                    Log.w(TAG, "seek failed: " + error.getClass().getSimpleName());
+                }
+            });
+        }
+        public void togglePlayback() {
+            MAIN.post(() -> {
+                ExoPlayer current = player;
+                if (current == null) return;
+                try {
+                    boolean resume = !current.getPlayWhenReady();
+                    current.setPlayWhenReady(resume);
+                    playbackPlaying = resume;
+                } catch (Throwable error) {
+                    Log.w(TAG, "play/pause failed: " +
+                            error.getClass().getSimpleName());
+                }
+            });
+        }
+        public boolean isPlaybackPlaying() { return playbackPlaying; }
+        public boolean isAutoStereo() { return "auto".equals(requestedStereo); }
+        void setDetectedStereo(String value) { detectedStereo = safe(value); }
+        public String activeStereo() {
+            return isAutoStereo()
+                    ? (detectedStereo.isEmpty() ? "mono" : detectedStereo)
+                    : requestedStereo;
+        }
+        public int activeAngle() {
+            float ratio = videoHeight > 0 ? videoWidth / (float)videoHeight : 2f;
+            return ratio > .72f && ratio < 1.30f ? 360 : 180;
+        }
+
+        private void startProgressPolling() {
+            if (progressPolling) return;
+            progressPolling = true;
+            MAIN.post(progressPoll);
+        }
+
+        private void disposeCaptureOnUi() {
+            if (disposed) return;
+            disposed = true;
+            progressPolling = false;
+            MAIN.removeCallbacks(progressPoll);
+            try { abortCaptureThread(); } catch (Throwable ignored) {}
+            try {
+                if (mGlSurfaceView != null) mGlSurfaceView.onPause();
+            } catch (Throwable ignored) {}
+            try {
+                if (mRootLayout != null) {
+                    ViewGroup parent = (ViewGroup)mRootLayout.getParent();
+                    if (parent != null) parent.removeView(mRootLayout);
+                }
+            } catch (Throwable ignored) {}
+            try {
+                if (owner != null) owner.getFragmentManager()
+                        .beginTransaction()
+                        .remove(this)
+                        .commitAllowingStateLoss();
+            } catch (Throwable ignored) {}
+            mInitialized = false;
+            mDisposed = true;
+        }
+
+        @Override
+        public void Dispose() {
+            if (disposeScheduled || mDisposed) return;
+            disposeScheduled = true;
+
+            // This method is invoked by TLab's native plug-in on Unity's render
+            // thread. ReleaseSharedTexture must remain here because it calls GL.
+            try { ReleaseSharedTexture(); } catch (Throwable ignored) {}
+
+            Activity target = owner;
+            if (target == null) {
+                mDisposed = true;
+                return;
+            }
+            target.runOnUiThread(this::disposeCaptureOnUi);
+        }
+    }
+
+    private static Display findExternalDisplay(Activity activity) {
+        DisplayManager manager = (DisplayManager)
+                activity.getSystemService(Context.DISPLAY_SERVICE);
+        if (manager == null) return null;
+        Display fallback = null;
+        for (Display display : manager.getDisplays()) {
+            if (display == null || display.getDisplayId() == Display.DEFAULT_DISPLAY)
+                continue;
+            if (fallback == null) fallback = display;
+            String name = safe(display.getName()).toLowerCase(Locale.ROOT);
+            if (name.contains("xreal") || name.contains("nreal")) return display;
+        }
+        return fallback;
+    }
+
+    private static int clampAngle(int value) {
+        if (value >= 300) return 360;
+        if (value >= 150) return 180;
+        if (value >= 105) return 120;
+        if (value >= 45) return 90;
+        return 180;
+    }
+
+    private static String normalizeStereo(String value) {
+        String mode = safe(value).toLowerCase(Locale.ROOT);
+        return mode.equals("tb") || mode.equals("mono") || mode.equals("auto")
+                ? mode : "sbs";
+    }
+
+    private static String safe(String value) { return value == null ? "" : value; }
+
+    private static final class CaptureState {
+        final WebView view;
+        final WebViewClient delegate;
+        final WebViewClient wrapper;
+        volatile String pageUrl = "";
+        volatile String userAgent = "";
+        volatile Candidate candidate;
+        final java.util.ArrayList<Candidate> candidates = new java.util.ArrayList<>();
+        final java.util.HashSet<String> rejectedUrls = new java.util.HashSet<>();
+
+        CaptureState(WebView webView, WebViewClient original) {
+            view = webView;
+            delegate = original != null ? original : new WebViewClient();
+            wrapper = new DelegatingClient(this);
+            refreshPageContext(webView.getUrl());
+        }
+
+        synchronized void clear() {
+            candidate = null;
+            candidates.clear();
+            rejectedUrls.clear();
+        }
+
+        synchronized Candidate currentCandidate() { return candidate; }
+
+        synchronized boolean rejectCurrentCandidate() {
+            Candidate rejected = candidate;
+            if (rejected == null) return false;
+            rejectedUrls.add(rejected.url);
+            candidates.remove(rejected);
+            candidate = candidates.isEmpty() ? null : candidates.get(0);
+            Log.i(TAG, "rejected preview candidate; alternatives=" + candidates.size());
+            return candidate != null;
+        }
+
+        void refreshPageContext(String url) {
+            pageUrl = safe(url);
+            try {
+                userAgent = safe(view.getSettings().getUserAgentString());
+            } catch (Throwable ignored) {
+                userAgent = "";
+            }
+        }
+
+        void observe(WebResourceRequest request) {
+            if (request == null || request.getUrl() == null) return;
+            String url = request.getUrl().toString();
+            String lower = url.toLowerCase(Locale.ROOT);
+            if (lower.contains("mime=audio") || lower.contains("audio%2f")) return;
+            Map<String, String> requestHeaders = request.getRequestHeaders();
+            String accept = headerValue(requestHeaders, "Accept").toLowerCase(Locale.ROOT);
+            String range = headerValue(requestHeaders, "Range");
+            String destination = headerValue(requestHeaders, "Sec-Fetch-Dest")
+                    .toLowerCase(Locale.ROOT);
+            int priority;
+            String kind;
+            if (lower.contains(".m3u8") || lower.contains("format=m3u8") ||
+                    lower.contains("mime=application%2fx-mpegurl")) {
+                priority = 50; kind = "hls";
+            } else if (lower.contains(".mpd") || lower.contains("format=mpd") ||
+                    lower.contains("mime=application%2fdash")) {
+                priority = 50; kind = "dash";
+            } else if (lower.contains(".mp4") || lower.contains(".webm")) {
+                priority = 40; kind = "file";
+            } else if (lower.contains("videoplayback")) {
+                priority = 25; kind = "adaptive";
+            } else if (lower.contains("mime=video") || lower.contains("mime=video%2f") ||
+                    accept.contains("video/") || destination.equals("video")) {
+                // Some embedded players deliberately use extension-less signed
+                // endpoints. Chromium still marks those requests as video.
+                // Keep them behind explicit HLS/DASH/file candidates so the
+                // already validated DeoVR path is unaffected.
+                priority = 35; kind = "media";
+            } else if (!range.isEmpty()) {
+                // Progressive HTML5 players commonly expose only an opaque URL
+                // plus a byte Range header. This is a last-resort candidate: an
+                // ad/file candidate is tried first and can then be rejected in
+                // favour of this one after Media3 measures its real dimensions.
+                priority = 20; kind = "range";
+            } else {
+                return;
+            }
+            long now = android.os.SystemClock.elapsedRealtime();
+            String cookie = "";
+            try {
+                // CookieManager's synchronous accessor is thread-safe and does
+                // not touch the WebView object. Keep the value in memory only.
+                cookie = safe(CookieManager.getInstance().getCookie(url));
+            } catch (Throwable ignored) { }
+            Candidate observed = new Candidate(
+                    normalizeMediaUrl(url, kind), requestHeaders, cookie,
+                    priority, kind, now);
+            synchronized (this) {
+                if (rejectedUrls.contains(observed.url)) return;
+                for (int index = candidates.size() - 1; index >= 0; index--) {
+                    if (candidates.get(index).url.equals(observed.url))
+                        candidates.remove(index);
+                }
+                int insertAt = 0;
+                while (insertAt < candidates.size() &&
+                        candidates.get(insertAt).priority > observed.priority)
+                    insertAt++;
+                // Newest stream wins among equal priorities, but older streams
+                // remain available when decoding proves this one is a preview.
+                candidates.add(insertAt, observed);
+                while (candidates.size() > 12)
+                    candidates.remove(candidates.size() - 1);
+                candidate = candidates.get(0);
+            }
+            Log.i(TAG, "captured " + kind + " video request (URL redacted)");
+        }
+
+        private static String headerValue(Map<String, String> headers, String wanted) {
+            if (headers == null || wanted == null) return "";
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(wanted))
+                    return safe(entry.getValue());
+            }
+            return "";
+        }
+    }
+
+    private static final class Candidate {
+        final String url;
+        final Map<String, String> headers;
+        final String cookie;
+        final String mimeType;
+        final int priority;
+        final String kind;
+        final long whenMs;
+
+        Candidate(
+                String value,
+                Map<String, String> requestHeaders,
+                String requestCookie,
+                int rank,
+                String type,
+                long timestamp) {
+            url = value;
+            headers = new java.util.HashMap<>();
+            if (requestHeaders != null) headers.putAll(requestHeaders);
+            cookie = safe(requestCookie);
+            String detectedMime = "";
+            try {
+                detectedMime = safe(Uri.parse(value).getQueryParameter("mime"));
+            } catch (Throwable ignored) { }
+            if (detectedMime.isEmpty()) {
+                if ("hls".equals(type)) detectedMime = "application/x-mpegURL";
+                else if ("dash".equals(type)) detectedMime = "application/dash+xml";
+            }
+            mimeType = detectedMime;
+            priority = rank;
+            kind = type;
+            whenMs = timestamp;
+        }
+    }
+
+    /**
+     * Chromium requests YouTube adaptive files in byte-range chunks by appending
+     * range/rn/rbuf to the signed googlevideo URL. Replaying the last chunk gives
+     * Media3 bytes from the middle of WebM/MP4 and therefore no container header.
+     * Preserve the signed URL byte-for-byte while removing only those transient
+     * transport parameters, so Media3 starts at byte zero.
+     */
+    private static String normalizeMediaUrl(String value, String kind) {
+        if (!"adaptive".equals(kind) || value == null) return safe(value);
+        int queryAt = value.indexOf('?');
+        if (queryAt < 0 || queryAt == value.length() - 1) return value;
+        String base = value.substring(0, queryAt);
+        String fragment = "";
+        String query = value.substring(queryAt + 1);
+        int hashAt = query.indexOf('#');
+        if (hashAt >= 0) {
+            fragment = query.substring(hashAt);
+            query = query.substring(0, hashAt);
+        }
+        StringBuilder clean = new StringBuilder();
+        for (String part : query.split("&")) {
+            if (part.isEmpty()) continue;
+            int equals = part.indexOf('=');
+            String key = equals < 0 ? part : part.substring(0, equals);
+            String lower = key.toLowerCase(Locale.ROOT);
+            if (lower.equals("range") || lower.equals("rn") ||
+                    lower.equals("rbuf") || lower.equals("alr")) continue;
+            if (clean.length() > 0) clean.append('&');
+            clean.append(part);
+        }
+        return base + (clean.length() == 0 ? "" : "?" + clean) + fragment;
+    }
+
+    private static final class DelegatingClient extends WebViewClient {
+        private final CaptureState state;
+
+        DelegatingClient(CaptureState capture) { state = capture; }
+
+        @Override
+        public void onPageStarted(WebView view, String url, Bitmap favicon) {
+            state.clear();
+            state.refreshPageContext(url);
+            state.delegate.onPageStarted(view, url, favicon);
+        }
+
+        @Override
+        public void onPageFinished(WebView view, String url) {
+            state.refreshPageContext(url);
+            state.delegate.onPageFinished(view, url);
+        }
+
+        @Override
+        public void onLoadResource(WebView view, String url) {
+            state.delegate.onLoadResource(view, url);
+        }
+
+        @Nullable
+        @Override
+        public WebResourceResponse shouldInterceptRequest(
+                WebView view, WebResourceRequest request) {
+            state.observe(request);
+            return state.delegate.shouldInterceptRequest(view, request);
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(
+                WebView view, WebResourceRequest request) {
+            return state.delegate.shouldOverrideUrlLoading(view, request);
+        }
+
+        @Override
+        public void onReceivedHttpAuthRequest(
+                WebView view,
+                HttpAuthHandler handler,
+                String host,
+                String realm) {
+            state.delegate.onReceivedHttpAuthRequest(view, handler, host, realm);
+        }
+
+        @Override
+        public void onReceivedSslError(
+                WebView view, SslErrorHandler handler, SslError error) {
+            state.delegate.onReceivedSslError(view, handler, error);
+        }
+    }
+
+    private static final class StreamDescriptor {
+        final String url;
+        final String userAgent;
+        final String mimeType;
+        final java.util.HashMap<String, String> headers;
+
+        StreamDescriptor(
+                String streamUrl,
+                String agent,
+                String mediaMimeType,
+                java.util.HashMap<String, String> requestHeaders) {
+            url = streamUrl;
+            userAgent = agent;
+            mimeType = mediaMimeType;
+            headers = requestHeaders;
+        }
+
+        static StreamDescriptor parse(String json) throws Exception {
+            JSONObject root = new JSONObject(json);
+            String url = root.optString("url", "");
+            String agent = root.optString("userAgent", "");
+            String mimeType = root.optString("mimeType", "");
+            java.util.HashMap<String, String> headers = new java.util.HashMap<>();
+            JSONObject source = root.optJSONObject("headers");
+            if (source != null) {
+                Iterator<String> keys = source.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    if (key.equalsIgnoreCase("Range") ||
+                            key.equalsIgnoreCase("Cookie")) continue;
+                    headers.put(key, source.optString(key, ""));
+                }
+            }
+            String cookie = root.optString("cookie", "");
+            String page = root.optString("pageUrl", "");
+            if (!cookie.isEmpty()) headers.put("Cookie", cookie);
+            if (!page.isEmpty() && !headers.containsKey("Referer"))
+                headers.put("Referer", page);
+            if (!agent.isEmpty()) headers.put("User-Agent", agent);
+            return new StreamDescriptor(url, agent, mimeType, headers);
+        }
+    }
+
+    private interface TextureReady { void onReady(SurfaceTexture texture); }
+
+    /** GLES2 equirectangular dome renderer with SBS/TB/mono source layouts. */
+    private static final class VrRenderer implements GLSurfaceView.Renderer,
+            SurfaceTexture.OnFrameAvailableListener {
+        private final TextureReady ready;
+        private volatile float yaw;
+        private volatile float pitch;
+        private volatile float baseYaw;
+        private volatile float basePitch;
+        private volatile boolean poseInitialized;
+        private volatile int angle = 180;
+        private volatile String requestedStereo = "auto";
+        private volatile String detectedStereo = "mono";
+        private volatile boolean frameReady;
+        private int program;
+        private int textureId;
+        private int aPosition;
+        private int aUv;
+        private int uTextureMatrix;
+        private int uTexScale;
+        private int uTexOffset;
+        private int uProjectionMode;
+        private int uHeadYaw;
+        private int uHeadPitch;
+        private int uEyeYawOffset;
+        private int uTanHalfFovX;
+        private int uTanHalfFovY;
+        private int width = 1;
+        private int height = 1;
+        private SurfaceTexture texture;
+        private FloatBuffer quadVertices;
+        private FloatBuffer quadUvs;
+        private final float[] textureMatrix = new float[16];
+
+        VrRenderer(TextureReady callback) { ready = callback; }
+
+        void setHeadPose(float y, float p) {
+            yaw = y;
+            pitch = p;
+            if (!poseInitialized) {
+                baseYaw = y;
+                basePitch = p;
+                poseInitialized = true;
+            }
+        }
+
+        void recenter() { baseYaw = yaw; basePitch = pitch; }
+
+        void configure(int degrees, String layout) {
+            angle = degrees;
+            requestedStereo = layout;
+        }
+
+        boolean isAutoStereo() { return "auto".equals(requestedStereo); }
+
+        String activeStereo() {
+            return isAutoStereo() ? detectedStereo : requestedStereo;
+        }
+
+        void setDetectedStereo(String value) {
+            if (value == null || value.isEmpty()) return;
+            detectedStereo = value;
+        }
+
+        int activeAngle() { return angle; }
+
+        /**
+         * Media3 commonly receives no spherical metadata from web MP4 streams.
+         * A mono 2:1 equirectangular frame is a 360 panorama; projecting that
+         * complete texture over a 180 dome squeezes the rear hemisphere into
+         * the front and appears as two/three repeated screens in the glasses.
+         * Stereo VR180 remains 180 because each packed eye is approximately
+         * square. Explicit Media3 stereo metadata always wins over this rule.
+         */
+        void detectProjection(int videoWidth, int videoHeight) {
+            if (videoWidth <= 0 || videoHeight <= 0) return;
+            String stereo = activeStereo();
+            float ratio = videoWidth / (float)videoHeight;
+            // Web VR CDNs frequently omit container stereo metadata. The
+            // measured DeoVR 3D stream is 3840x1920: two square 1920x1920 eyes
+            // packed side-by-side. Treat high-resolution 2:1 assets as VR180
+            // SBS in auto mode. The explicit MONO selector remains available
+            // for genuine high-resolution mono 360 panoramas.
+            if (isAutoStereo() && "mono".equals(stereo) &&
+                    videoWidth >= 3000 && ratio >= 1.8f && ratio <= 2.2f) {
+                detectedStereo = "sbs";
+                stereo = "sbs";
+            }
+            int detectedAngle = angle;
+            if ("mono".equals(stereo))
+                detectedAngle = ratio >= 1.8f && ratio <= 2.2f ? 360 : 180;
+            else if ("sbs".equals(stereo) || "tb".equals(stereo))
+                detectedAngle = 180;
+            if (detectedAngle != angle) {
+                angle = detectedAngle;
+            }
+            Log.i(TAG, "projection auto=" + detectedAngle +
+                    " ratio=" + String.format(Locale.ROOT, "%.3f", ratio) +
+                    " stereo=" + stereo);
+        }
+
+        @Override
+        public void onSurfaceCreated(
+                javax.microedition.khronos.opengles.GL10 unused,
+                javax.microedition.khronos.egl.EGLConfig config) {
+            program = makeProgram();
+            aPosition = GLES20.glGetAttribLocation(program, "aPosition");
+            aUv = GLES20.glGetAttribLocation(program, "aUv");
+            uTextureMatrix = GLES20.glGetUniformLocation(program, "uTextureMatrix");
+            uTexScale = GLES20.glGetUniformLocation(program, "uTexScale");
+            uTexOffset = GLES20.glGetUniformLocation(program, "uTexOffset");
+            uProjectionMode = GLES20.glGetUniformLocation(program, "uProjectionMode");
+            uHeadYaw = GLES20.glGetUniformLocation(program, "uHeadYawRad");
+            uHeadPitch = GLES20.glGetUniformLocation(program, "uHeadPitchRad");
+            uEyeYawOffset = GLES20.glGetUniformLocation(program, "uEyeYawOffsetRad");
+            uTanHalfFovX = GLES20.glGetUniformLocation(program, "uTanHalfFovX");
+            uTanHalfFovY = GLES20.glGetUniformLocation(program, "uTanHalfFovY");
+            int[] ids = new int[1];
+            GLES20.glGenTextures(1, ids, 0);
+            textureId = ids[0];
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+            Matrix.setIdentityM(textureMatrix, 0);
+            GLES20.glClearColor(0f, 0f, 0f, 1f);
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST);
+            GLES20.glDisable(GLES20.GL_CULL_FACE);
+            quadVertices = directFloats(new float[]{
+                    -1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f});
+            quadUvs = directFloats(new float[]{
+                    0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f});
+            Log.i(TAG, "renderer=vr2xr-raymap per-eye SBS");
+            texture = new SurfaceTexture(textureId);
+            texture.setOnFrameAvailableListener(this);
+            ready.onReady(texture);
+        }
+
+        @Override
+        public void onSurfaceChanged(
+                javax.microedition.khronos.opengles.GL10 unused, int w, int h) {
+            width = Math.max(1, w);
+            height = Math.max(1, h);
+            Log.i(TAG, "VR surface=" + width + "x" + height);
+        }
+
+        @Override
+        public void onFrameAvailable(SurfaceTexture ignored) { frameReady = true; }
+
+        @Override
+        public void onDrawFrame(javax.microedition.khronos.opengles.GL10 unused) {
+            if (frameReady && texture != null) {
+                frameReady = false;
+                try {
+                    texture.updateTexImage();
+                    texture.getTransformMatrix(textureMatrix);
+                } catch (Throwable ignored) {}
+            }
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+            GLES20.glUseProgram(program);
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
+            quadVertices.position(0);
+            GLES20.glVertexAttribPointer(
+                    aPosition, 2, GLES20.GL_FLOAT, false, 0, quadVertices);
+            GLES20.glEnableVertexAttribArray(aPosition);
+            quadUvs.position(0);
+            GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, quadUvs);
+            GLES20.glEnableVertexAttribArray(aUv);
+            GLES20.glUniformMatrix4fv(
+                    uTextureMatrix, 1, false, textureMatrix, 0);
+            GLES20.glUniform1i(uProjectionMode, angle >= 300 ? 1 : 0);
+            GLES20.glUniform1f(uHeadYaw,
+                    (float)Math.toRadians(yaw - baseYaw));
+            GLES20.glUniform1f(uHeadPitch,
+                    (float)Math.toRadians(pitch - basePitch));
+
+            int halfWidth = width / 2;
+            int safeHeight = Math.max(1, height);
+            float tanHalfFovY = (float)Math.tan(Math.toRadians(47.5));
+            for (int eye = 0; eye < 2; eye++) {
+                int eyeWidth = eye == 0 ? halfWidth : width - halfWidth;
+                GLES20.glViewport(eye == 0 ? 0 : halfWidth,
+                        0, Math.max(1, eyeWidth), safeHeight);
+                float[] uv = eyeUv(eye);
+                GLES20.glUniform2f(uTexScale, uv[0], uv[1]);
+                GLES20.glUniform2f(uTexOffset, uv[2], uv[3]);
+                GLES20.glUniform1f(uEyeYawOffset, 0f);
+                GLES20.glUniform1f(uTanHalfFovY, tanHalfFovY);
+                GLES20.glUniform1f(uTanHalfFovX,
+                        tanHalfFovY * (Math.max(1, eyeWidth) / (float)safeHeight));
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            }
+            GLES20.glDisableVertexAttribArray(aPosition);
+            GLES20.glDisableVertexAttribArray(aUv);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);
+        }
+
+        private float[] eyeUv(int eye) {
+            String stereo = activeStereo();
+            if ("tb".equals(stereo))
+                return eye == 0
+                        ? new float[]{1f, .5f, 0f, .5f}
+                        : new float[]{1f, .5f, 0f, 0f};
+            if ("mono".equals(stereo)) return new float[]{1f, 1f, 0f, 0f};
+            return eye == 0
+                    ? new float[]{.5f, 1f, 0f, 0f}
+                    : new float[]{.5f, 1f, .5f, 0f};
+        }
+
+        private FloatBuffer directFloats(float[] values) {
+            FloatBuffer result = ByteBuffer.allocateDirect(values.length * 4)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer();
+            result.put(values).position(0);
+            return result;
+        }
+
+        private int makeProgram() {
+            String vertex =
+                    "attribute vec2 aPosition; attribute vec2 aUv;" +
+                    "varying vec2 vRawUv; void main(){" +
+                    "gl_Position=vec4(aPosition,0.0,1.0);vRawUv=aUv;}";
+            String fragment =
+                    "#extension GL_OES_EGL_image_external : require\n" +
+                    "precision highp float;" +
+                    "varying vec2 vRawUv; uniform samplerExternalOES uTexture;" +
+                    "uniform mat4 uTextureMatrix; uniform vec2 uTexScale;" +
+                    "uniform vec2 uTexOffset; uniform int uProjectionMode;" +
+                    "uniform float uHeadYawRad; uniform float uHeadPitchRad;" +
+                    "uniform float uEyeYawOffsetRad; uniform float uTanHalfFovX;" +
+                    "uniform float uTanHalfFovY;" +
+                    "const float PI=3.14159265358979323846;" +
+                    "const float HALF_PI=1.57079632679489661923;" +
+                    "const float TWO_PI=6.28318530717958647692;" +
+                    "vec3 rotateYaw(vec3 v,float a){float c=cos(a),s=sin(a);" +
+                    "return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}" +
+                    "vec3 rotatePitch(vec3 v,float a){float c=cos(a),s=sin(a);" +
+                    "return vec3(v.x,c*v.y-s*v.z,s*v.y+c*v.z);}" +
+                    "vec3 viewRay(vec2 uv){float x=uv.x*2.0-1.0;" +
+                    "float y=1.0-uv.y*2.0;vec3 r=normalize(vec3(" +
+                    "x*uTanHalfFovX,y*uTanHalfFovY,1.0));" +
+                    "r=rotatePitch(r,uHeadPitchRad);" +
+                    "return rotateYaw(r,uHeadYawRad+uEyeYawOffsetRad);}" +
+                    "vec2 map180(vec3 r){float y=atan(r.x,r.z);" +
+                    "float p=asin(clamp(r.y,-1.0,1.0));" +
+                    "if(abs(y)>HALF_PI)return vec2(-1.0);" +
+                    "return vec2(y/PI+0.5,0.5-p/PI);}" +
+                    "vec2 map360(vec3 r){float y=atan(r.x,r.z);" +
+                    "float p=asin(clamp(r.y,-1.0,1.0));" +
+                    "float w=mod(y/TWO_PI+0.5,1.0);if(w<0.0)w+=1.0;" +
+                    "return vec2(w,0.5-p/PI);}" +
+                    "void main(){vec3 r=viewRay(vRawUv);vec2 uv=" +
+                    "uProjectionMode==1?map360(r):map180(r);" +
+                    "if(uv.x<0.0||uv.y<0.0||uv.x>1.0||uv.y>1.0){" +
+                    "gl_FragColor=vec4(0.0,0.0,0.0,1.0);return;}" +
+                    "vec2 sourceUv=uv*uTexScale+uTexOffset;" +
+                    "sourceUv=(uTextureMatrix*vec4(sourceUv,0.0,1.0)).xy;" +
+                    "gl_FragColor=texture2D(uTexture,sourceUv);}";
+            int result = GLES20.glCreateProgram();
+            GLES20.glAttachShader(result, compile(GLES20.GL_VERTEX_SHADER, vertex));
+            GLES20.glAttachShader(result, compile(GLES20.GL_FRAGMENT_SHADER, fragment));
+            GLES20.glLinkProgram(result);
+            int[] ok = new int[1];
+            GLES20.glGetProgramiv(result, GLES20.GL_LINK_STATUS, ok, 0);
+            if (ok[0] == 0) throw new IllegalStateException(
+                    "GL link failed: " + GLES20.glGetProgramInfoLog(result));
+            return result;
+        }
+
+        private int compile(int type, String source) {
+            int shader = GLES20.glCreateShader(type);
+            GLES20.glShaderSource(shader, source);
+            GLES20.glCompileShader(shader);
+            int[] ok = new int[1];
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, ok, 0);
+            if (ok[0] == 0) throw new IllegalStateException(
+                    "GL shader failed: " + GLES20.glGetShaderInfoLog(shader));
+            return shader;
+        }
+    }
+}

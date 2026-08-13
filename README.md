@@ -10,6 +10,10 @@ Eye/MediaPipe interaction implementation, build scripts, troubleshooting notes
 and a ready-to-install APK. It does **not** contain the private Memory/Brain2
 backend, user data, cloud credentials, or the proprietary XREAL SDK archive.
 
+The current public source is synchronized with the hardware-validated **v52 UI
+baseline**: the complete spatial window system, Android-app/cinema bridges and
+the immersive VR browser are included rather than represented by a demo stub.
+
 ## Hardware validation
 
 The current interaction baseline was tested on real hardware on 11 August 2026:
@@ -39,13 +43,22 @@ page](https://developer.xreal.com/download/).
   portrait/landscape/aspect controls, close and persistent placement;
 - reorganizable 3-4-3 app dock, quick system menu and multi-row window blocks;
 - Android app surfaces for Chrome/Google, YouTube, Reddit and Spotify;
-- XR keyboard and gaze/pinch text input;
+- an internal spatial browser with XR keyboard, gaze/pinch text input, page
+  zoom and scrolling;
+- immersive browser video: direct media-stream capture, mono/SBS selection,
+  VR180/VR360 projection, head-tracked viewing and in-VR seek/playback controls;
 - protected cinema handoff for Netflix and Prime Video with an in-cinema dock
   and a clean return to the 3D shell;
 - Moonlight as a spatial 3D window or a full 2D desktop surface;
 - XREAL brightness and electrochromic controls, Android media volume, phone
   battery, time, thermal/tracking status and first-person video capture;
 - saved window/session layout plus DeX/Shizuku startup repair.
+
+Dock icons are loaded from each installed Android package at runtime, so the
+real Chrome, YouTube, Netflix, Spotify, Reddit, Prime Video and Moonlight icons
+appear without redistributing third-party artwork. A fallback glyph is shown
+when Android cannot expose an icon. XReel OS itself ships with its own launcher
+icon under `unity/Assets/Brand/`.
 
 The first-person recorder is configured without microphone audio. Eye frames
 are processed ephemerally and are not saved by the hand-tracking path.
@@ -67,7 +80,7 @@ are processed ephemerally and are not saved by the hand-tracking path.
    & $adb install -r ".\releases\XReelOs.apk"
    ```
 
-   Release `1.0` is 158,991,789 bytes. Its SHA-256 is published in
+   The current release size and SHA-256 are published in
    [`releases/SHA256SUMS.txt`](releases/SHA256SUMS.txt).
 
 4. Run the reproducible preflight while the phone is reachable by ADB:
@@ -106,7 +119,10 @@ head-only mode are documented in [Interaction reference](docs/INTERACTION.md).
 Prerequisites:
 
 - Unity `6000.0.23f1` with Android Build Support, IL2CPP and ARM64 tools;
+- Gradle 8.7 available on `PATH` (only when rebuilding the hand AAR);
 - XREAL SDK for Unity `3.1.0`, downloaded under XREAL's own terms;
+- a matching licensed ControlGlasses `libnr_service.so` for the local lens
+  control bridge (the proprietary library is not committed);
 - the MediaPipe hand model at `unity/models/hand_landmarker.task`.
 
 Place the XREAL archive at:
@@ -118,17 +134,26 @@ unity/Packages/xreal-sdk/com.xreal.xr.tar.gz
 Then run:
 
 ```powershell
+.\scripts\BUILD_XREAL_LENS_PROBE_AAR.ps1 `
+  -PrivateLibrary "C:\path\to\matching\libnr_service.so"
 .\scripts\BUILD_HAND_PLUGIN.ps1
 .\scripts\BUILD_XREEL_OS.ps1
 ```
 
-The first command rebuilds the public hand-only Android bridge and runs its JVM
-tests. It deliberately excludes the private ASR/ONNX/audio modules. The second
-command builds the Unity APK with version `6000.0.23f1`.
+The lens command compiles the reviewable Java bridge against the
+developer-supplied ControlGlasses native library; that raw AAR remains
+git-ignored. The hand command rebuilds the public hand-only Android bridge and
+runs its JVM tests. It deliberately excludes the private ASR/ONNX/audio modules.
+The final command builds the Unity APK with version `6000.0.23f1`.
+
+The checked-in APK is development-signed for direct sideload testing. Forks
+intended for store or production distribution must use their own release key.
 
 The Android target is mandatory at editor startup because several XREAL SDK
 settings are compiled only under `UNITY_ANDROID`. The output is
-`unity/build/android/XReelOs.apk`. See [Build guide](docs/BUILD_GUIDE.md).
+`unity/build/android/XReelOs.apk`. Start with the short
+[build guide](docs/BUILD_GUIDE.md); the complete hardware and renderer runbook
+is [Build Guide XREAL](docs/BUILD_GUIDE_XREAL.md).
 
 ## Source map
 
@@ -144,8 +169,14 @@ settings are compiled only under `UNITY_ANDROID`. The output is
 - `unity/Assets/Scripts/UI/WorldCreatorQuickMenu.cs` and
   `WorldCreatorWindowBlock.cs` — quick menu, dock and grouped layouts;
 - `unity/Assets/Scripts/Lab/WorldCreatorLabShell.cs` — OS app shell, Android app
-  slots, keyboard, cinema and Moonlight orchestration;
+  slots, internal browser, keyboard, cinema, Moonlight and VR orchestration;
+- `unity/Assets/Scripts/Lab/XrLabWebVr*.cs` — media discovery, Android external
+  texture transport and the Unity VR180/VR360 presenter;
+- `unity/Assets/Resources/XrLabWebVr.shader` — per-eye mono/SBS sampling and
+  immersive projection shader;
 - `unity/Assets/Scripts/SecureSurfaceSpike/` — protected/system surface bridge;
+- `scripts/xreal-compat/` — reviewable Samsung/XREAL display compatibility,
+  secure-surface native probe and compile-only Android platform signatures;
 - `unity/Assets/Scripts/Editor/AndroidBuildXreal.cs` — reproducible Android build.
 
 See [Architecture](docs/ARCHITECTURE.md) for the runtime data flow.
@@ -165,6 +196,9 @@ from these public projects and official samples:
   — useful hand-landmark and streaming reference;
 - [PortalPad](https://github.com/Smart-Home-User/PortalPad) — Shizuku input,
   external-display and DRM/system-mirror research;
+- [vr2xr](https://github.com/skarian/vr2xr) and
+  [mpv-android-vr](https://github.com/mpv-android-vr/mpv-android-vr) — useful
+  projection, stereo-layout and Android VR playback references;
 - [MediaPipe](https://github.com/google-ai-edge/mediapipe) — Hand Landmarker;
 - [TLabWebView](https://github.com/TLabAltoh/TLabWebView) and
   [TLabVKeyborad](https://github.com/TLabAltoh/TLabVKeyborad) — Unity Android

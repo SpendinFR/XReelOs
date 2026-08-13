@@ -557,6 +557,8 @@ namespace MLOmega.XR.UI
                         _creator.OpenDeckFromPalm();
                     break;
                 case GestureKind.TwoPalmMenu:
+                    if (GestureBridge.TryHandleTwoPalmOverride())
+                        break;
                     if (_creator != null)
                         _creator.OpenWindowDockFromTwoPalms();
                     break;
