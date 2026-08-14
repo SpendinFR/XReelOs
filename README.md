@@ -1,5 +1,8 @@
 # XReel OS
-<img width="1274" height="916" alt="DockXreelOs" src="https://github.com/user-attachments/assets/bec4ba25-58e5-4bf4-a866-517b30c5f139" />
+
+<p align="center">
+  <img width="800" alt="DockXreelOs" src="https://github.com/user-attachments/assets/bec4ba25-58e5-4bf4-a866-517b30c5f139" />
+</p>
 
 XReel OS is an experimental spatial shell for **XREAL One Pro + XREAL Eye**.
 It turns Android apps, browser surfaces, protected cinema playback and a remote
