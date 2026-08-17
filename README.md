@@ -12,11 +12,9 @@ release does not claim optical eye tracking.
 
 This repository contains the Unity source, Android bridge code, the complete
 Eye/MediaPipe interaction implementation, build scripts, troubleshooting notes
-and a ready-to-install APK. It does **not** contain the private Memory/Brain2
-backend, user data, cloud credentials, or the proprietary XREAL SDK archive.
+and a ready-to-install APK. It does not contains the proprietary XREAL SDK archive.
 
-The public source is based on the hardware-validated **v52 UI baseline**: the
-complete spatial window system, Android-app/cinema bridges and immersive VR
+The complete spatial window system, Android-app/cinema bridges and immersive VR
 browser are included rather than represented by a demo stub.
 
 ## Downloads and release status
